@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import os, json, argparse, datetime as dt
 import requests
-from urllib.parse import urlencode
 
 OM_URL = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
 OUT_DIR = os.path.join("data", "om_baseline")
@@ -25,7 +24,6 @@ def daterange(start: dt.datetime, end: dt.datetime, chunk_hours=168):
 
 
 def make_retry_session():
-    # Optional: resilient HTTP client with retries & timeouts
     try:
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
@@ -45,16 +43,17 @@ def make_retry_session():
 
 
 def get_om(
-    session, lat_list, lon_list, hourly, start_hour, end_hour, models=None, timeout=120
+    session, lat_seq, lon_seq, hourly, start_hour, end_hour, models=None, timeout=120
 ):
-    # Build params per Open-Meteo docs:
-    # - GET with query params
-    # - multiple coords allowed as comma-separated lists
-    # - time slicing via start_hour / end_hour (ISO8601)
-    # - model selection via "models" (plural)
+    """
+    lat_seq and lon_seq must be equal-length lists of paired coordinates.
+    """
+    if len(lat_seq) != len(lon_seq):
+        raise ValueError("latitude and longitude must have the same number of elements")
+
     params = {
-        "latitude": ",".join(f"{x:.6f}" for x in lat_list),
-        "longitude": ",".join(f"{x:.6f}" for x in lon_list),
+        "latitude": ",".join(f"{x:.6f}" for x in lat_seq),
+        "longitude": ",".join(f"{x:.6f}" for x in lon_seq),
         "hourly": ",".join(hourly),
         "start_hour": start_hour,  # e.g. 2025-11-01T00:00
         "end_hour": end_hour,  # e.g. 2025-11-07T00:00
@@ -63,9 +62,29 @@ def get_om(
     }
     if models:
         params["models"] = models  # e.g. "ecmwf_ifs"
+
     r = session.get(OM_URL, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+def make_linspace(vmin: float, vmax: float, steps: int):
+    if steps <= 1:
+        return [vmin]
+    return [vmin + i * (vmax - vmin) / (steps - 1) for i in range(steps)]
+
+
+def make_grid_pairs(lat_list, lon_list):
+    """
+    Cartesian product of lat_list x lon_list, returned as two equal-length lists
+    (latitudes and longitudes), so each index is a paired location.
+    """
+    lat_seq, lon_seq = [], []
+    for lat in lat_list:
+        for lon in lon_list:
+            lat_seq.append(lat)
+            lon_seq.append(lon)
+    return lat_seq, lon_seq
 
 
 def main():
@@ -84,14 +103,13 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    lat_list = [
-        args.lat_min + i * (args.lat_max - args.lat_min) / max(args.lat_steps - 1, 1)
-        for i in range(args.lat_steps)
-    ]
-    lon_list = [
-        args.lon_min + j * (args.lon_max - args.lon_min) / max(args.lon_steps - 1, 1)
-        for j in range(args.lon_steps)
-    ]
+    # Build 1D axes
+    lat_list = make_linspace(args.lat_min, args.lat_max, args.lat_steps)
+    lon_list = make_linspace(args.lon_min, args.lon_max, args.lon_steps)
+
+    # Build paired grid (length = lat_steps * lon_steps)
+    grid_lat, grid_lon = make_grid_pairs(lat_list, lon_list)
+    assert len(grid_lat) == len(grid_lon), "Paired lat/lon must be same length"
 
     t0 = dt.datetime.fromisoformat(args.start)
     t1 = dt.datetime.fromisoformat(args.end)
@@ -103,22 +121,23 @@ def main():
         e = b.strftime("%Y-%m-%dT%H:%M")
 
         # Best-match (combined models)
-        om = get_om(session, lat_list, lon_list, args.hourly, s, e, models=None)
+        om = get_om(session, grid_lat, grid_lon, args.hourly, s, e, models=None)
 
         # ECMWF IFS HRES explicitly
         ifs = None
         try:
             ifs = get_om(
-                session, lat_list, lon_list, args.hourly, s, e, models="ecmwf_ifs"
+                session, grid_lat, grid_lon, args.hourly, s, e, models="ecmwf_ifs"
             )
         except Exception as ex:
-            # Non-fatal: keep proceeding even if ECMWF request fails
             print(f"[warn] ecmwf_ifs request failed for {s}..{e}: {ex}")
 
         out = {
             "meta": {
-                "lat": lat_list,
-                "lon": lon_list,
+                "lat_axis": lat_list,
+                "lon_axis": lon_list,
+                "paired_lat": grid_lat,
+                "paired_lon": grid_lon,
                 "start": s,
                 "end": e,
                 "hourly": args.hourly,
@@ -131,7 +150,7 @@ def main():
         name = f"omifs_{a.strftime('%Y%m%d%H')}_{b.strftime('%Y%m%d%H')}.json"
         with open(os.path.join(OUT_DIR, name), "w") as f:
             json.dump(out, f)
-        print("saved", name)
+        print("saved", name, f"(locations={len(grid_lat)})")
 
 
 if __name__ == "__main__":
