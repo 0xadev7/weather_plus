@@ -19,7 +19,5 @@ dependencies = [
   "requests>=2.32",
   "python-dotenv>=1.0",
   "pyproj>=3.6",
-  "xESMF>=0.8.5",
-  "cdsapi>=0.7.7",
-  "pyarrow"
+  "xESMF>=0.8.5"
 ]
