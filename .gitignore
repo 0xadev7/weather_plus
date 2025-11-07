@@ -11,3 +11,5 @@ __pycache__/
 *.sqlite3
 models/**/*
 !models/README.md
+data/**/*
+tiles/**/*

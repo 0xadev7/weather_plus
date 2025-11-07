@@ -6,46 +6,39 @@ from joblib import load
 
 
 class Calibrator:
-    """
-    Loads per-variable calibration artifacts (e.g., EMOS/NGR linear/GAM/GBDT/QRF).
-    If no artifact is present, falls back to identity (or simple bias correction
-    with stored climatology if available).
-    """
-
     def __init__(self, model_dir: str):
         self.model_dir = model_dir
         self.cache: Dict[str, Any] = {}
 
-    def _artifact_path(self, var: str) -> str:
-        return os.path.join(self.model_dir, f"{var}.joblib")
+    def _paths_for(self, var: str, tile: Optional[str]):
+        paths = []
+        if tile:
+            paths.append(os.path.join(self.model_dir, f"{var}__{tile}.joblib"))
+        paths.append(os.path.join(self.model_dir, f"{var}.joblib"))  # global fallback
+        return paths
 
-    def _load(self, var: str):
-        path = self._artifact_path(var)
-        if os.path.exists(path):
-            self.cache[var] = load(path)
-        else:
-            self.cache[var] = None
+    def _load_best(self, var: str, tile: Optional[str]):
+        # cache key: (var, tile or "global")
+        key = (var, tile or "global")
+        if key in self.cache:
+            return self.cache[key]
+        for p in self._paths_for(var, tile):
+            if os.path.exists(p):
+                self.cache[key] = load(p)
+                return self.cache[key]
+        self.cache[key] = None
+        return None
 
-    def predict(self, var: str, X: np.ndarray, baseline: np.ndarray) -> np.ndarray:
-        """
-        X: engineered features [n, f] (can be minimal: baseline, lead, hour, lat, lon, elev)
-        baseline: baseline forecast values [n]
-        Returns calibrated forecast [n]
-        """
-        if var not in self.cache:
-            self._load(var)
-        model = self.cache[var]
-        if model is None:
-            # identity fallback
-            return baseline
-        # expected interface: model.predict(X) -> correction or calibrated value
-        yhat = model.predict(X)
-        # allow artifacts to be either absolute calibrated value or delta
+    def predict(
+        self, var: str, X: np.ndarray, baseline: np.ndarray, tile: Optional[str] = None
+    ) -> np.ndarray:
+        m = self._load_best(var, tile)
+        if m is None:
+            return baseline  # identity
+        yhat = m.predict(X)
+        # allow delta or absolute
         if yhat.shape == baseline.shape:
             return yhat
-        if yhat.shape == (X.shape[0],):
-            return yhat
-        # if model outputs delta as single column
         if yhat.ndim == 2 and yhat.shape[1] == 1:
             return baseline + yhat[:, 0]
-        return baseline
+        return yhat
