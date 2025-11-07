@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weather_plus"
+version = "0.1.0"
+description = "Calibrated, Open-Meteo-compatible forecast API that beats OM via postprocessing"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "numpy>=1.26",
+  "scikit-learn>=1.5",
+  "joblib>=1.4",
+  "xarray>=2024.6.0",
+  "pandas>=2.2",
+  "requests>=2.32",
+  "python-dotenv>=1.0",
+  "pyproj>=3.6",
+  "xESMF>=0.8.5",
+  "cdsapi>=0.7.7",
+  "pyarrow"
+]

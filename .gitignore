@@ -1,0 +1,13 @@
+.env
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints
+
+.vscode/
+.DS_Store
+.idea/
+*.log
+*.sqlite3
+models/**/*
+!models/README.md
