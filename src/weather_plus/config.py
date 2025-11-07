@@ -5,7 +5,6 @@ PORT = int(os.getenv("PORT", "8000"))
 MODEL_DIR = os.getenv(
     "MODEL_DIR", os.path.join(os.path.dirname(__file__), "../../models")
 )
-BASELINE_PROVIDER = os.getenv("BASELINE_PROVIDER", "open_meteo")
 OPEN_METEO_URL = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
 
 # variables we support (Open-Meteo names to stay wire-compatible)

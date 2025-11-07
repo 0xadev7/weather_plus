@@ -1,53 +1,121 @@
 from __future__ import annotations
 import os, time, datetime as dt
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Sequence, Union
 import numpy as np
 import requests
 
-from weather_plus.config import OPEN_METEO_URL, BASELINE_PROVIDER
+from weather_plus.config import OPEN_METEO_URL
+
+# ----------------------------
+# Helpers
+# ----------------------------
 
 
-def _as_list(x):
-    return x if isinstance(x, list) else [x]
+def _as_list(x: Union[float, Sequence[float]]) -> List[float]:
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return list(x)
+    return [float(x)]
 
 
-def _post_om(
-    hourly,
-    latitude,
-    longitude,
-    start_hour,
-    end_hour,
-    timezone,
+def _fmt_coord_list(vals: Sequence[float]) -> str:
+    # Open-Meteo accepts comma-separated coordinate lists
+    return ",".join(f"{v:.6f}" for v in vals)
+
+
+def _make_retry_session() -> requests.Session:
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        s = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        return s
+    except Exception:
+        return requests.Session()
+
+
+_SESSION = _make_retry_session()
+
+# ----------------------------
+# Open-Meteo fetch (GET, models=)
+# ----------------------------
+
+
+def _get_om(
+    hourly: Sequence[str],
+    latitude: Union[float, Sequence[float]],
+    longitude: Union[float, Sequence[float]],
+    start_hour: str,
+    end_hour: str,
+    timezone: Optional[str],
     model: Optional[str] = None,
-):
-    payload = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": hourly,
+    timeout: int = 90,
+) -> Dict[str, Any]:
+    """
+    Calls Open-Meteo /v1/forecast using GET.
+    - Multiple coords supported via comma-separated strings.
+    - Model selection via `models` (plural), e.g., 'ecmwf_ifs'.
+    """
+    lat_list = _as_list(latitude)
+    lon_list = _as_list(longitude)
+
+    params = {
+        "latitude": _fmt_coord_list(lat_list),
+        "longitude": _fmt_coord_list(lon_list),
+        "hourly": ",".join(hourly),
         "start_hour": start_hour,
         "end_hour": end_hour,
+        "timeformat": "iso8601",
     }
     if timezone:
-        payload["timezone"] = timezone
-    if model is not None:
-        payload["model"] = (
-            model  # Open-Meteo supports model filtering (validator uses "ecmwf_ifs")
-        )
-    r = requests.post(OPEN_METEO_URL, json=payload, timeout=90)
+        params["timezone"] = timezone
+    if model:
+        params["models"] = model  # NOTE: 'models' (plural) is required by Open-Meteo
+
+    r = _SESSION.get(OPEN_METEO_URL, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
+# Backward-compatible alias (if anything else imports _post_om)
+_post_om = _get_om
+
+# ----------------------------
+# Public API
+# ----------------------------
+
+
 def get_baselines(
-    latitude, longitude, hourly, start_hour, end_hour, timezone
+    latitude: Union[float, Sequence[float]],
+    longitude: Union[float, Sequence[float]],
+    hourly: Sequence[str],
+    start_hour: str,
+    end_hour: str,
+    timezone: Optional[str],
 ) -> Dict[str, Any]:
-    # Always pull OM default blend
-    om = _post_om(
+    """
+    Returns:
+      {
+        "om":  <Open-Meteo best-match/blended>,
+        "ifs": <ECMWF IFS HRES or None on failure>
+      }
+    """
+    # Best-match / blended (no explicit model)
+    om = _get_om(
         hourly, latitude, longitude, start_hour, end_hour, timezone, model=None
     )
-    # And ECMWF IFS HRES (validator logs this baseline too)
+
+    # ECMWF IFS HRES explicitly
     try:
-        ifs = _post_om(
+        ifs = _get_om(
             hourly,
             latitude,
             longitude,
@@ -58,6 +126,7 @@ def get_baselines(
         )
     except Exception:
         ifs = None
+
     return {"om": om, "ifs": ifs}
 
 

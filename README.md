@@ -14,7 +14,7 @@ pip install -e .
 2. CDS API
 
 ```bash
-~/.cdsapirc
+nano ~/.cdsapirc
 ```
 
 3. Fetch data & Train
