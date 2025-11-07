@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import requests
 
-from ..config import OPEN_METEO_URL, BASELINE_PROVIDER
+from weather_plus.config import OPEN_METEO_URL, BASELINE_PROVIDER
 
 
 def _as_list(x):

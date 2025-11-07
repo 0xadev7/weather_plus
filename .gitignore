@@ -10,6 +10,5 @@ __pycache__/
 *.log
 *.sqlite3
 models/**/*
-!models/README.md
 data/**/*
 tiles/**/*

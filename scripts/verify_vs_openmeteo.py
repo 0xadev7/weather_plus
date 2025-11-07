@@ -2,7 +2,7 @@
 import os, joblib, numpy as np, pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-MODEL_DIR = os.getenv("MODEL_DIR", "weather_plus/models")
+MODEL_DIR = os.getenv("MODEL_DIR", "./models")
 
 
 def eval_one(df_path, model_name, unit_note=""):

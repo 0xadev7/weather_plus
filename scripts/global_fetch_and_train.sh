@@ -21,22 +21,22 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         TILE="LAT${i}_LON${j}"
         
         echo "=== Fetching baselines for $TILE ($LAT_MIN,$LAT_MAX,$LON_MIN,$LON_MAX)"
-        python weather_plus/scripts/fetch_openmeteo_hindcast.py \
+        python scripts/fetch_openmeteo_hindcast.py \
         --lat-min $LAT_MIN --lat-max $LAT_MAX --lon-min $LON_MIN --lon-max $LON_MAX \
         --lat-steps 7 --lon-steps 9 \
         --start $START --end $END --chunk-hours 168
         
         echo "=== Fetching ERA5 for $TILE"
-        python weather_plus/scripts/fetch_era5_single_levels.py \
+        python scripts/fetch_era5_single_levels.py \
         --lat-min $LAT_MIN --lat-max $LAT_MAX --lon-min $LON_MIN --lon-max $LON_MAX \
         --start $START --end $END --outfile tiles/${TILE}_era5_single.nc
         
-        python weather_plus/scripts/fetch_era5_land.py \
+        python scripts/fetch_era5_land.py \
         --lat-min $LAT_MIN --lat-max $LAT_MAX --lon-min $LON_MIN --lon-max $LON_MAX \
         --start $START --end $END --outfile tiles/${TILE}_era5_land.nc
         
         echo "=== Pairing for $TILE"
-        python weather_plus/scripts/make_training_pairs_tile.py \
+        python scripts/make_training_pairs_tile.py \
         --era5-single tiles/${TILE}_era5_single.nc \
         --era5-land   tiles/${TILE}_era5_land.nc \
         --tile-id     $TILE

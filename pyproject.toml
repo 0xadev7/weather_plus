@@ -19,5 +19,16 @@ dependencies = [
   "requests>=2.32",
   "python-dotenv>=1.0",
   "pyproj>=3.6",
-  "xESMF>=0.8.5"
+  "xESMF>=0.8.5",
+  "cdsapi>=0.7.7",
+  "pyarrow"
 ]
+
+[tool.setuptools.package-dir]
+# Tell setuptools that packages live under src/
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["weather_plus", "weather_plus.*"]
+exclude = ["tests*", "docs*"]

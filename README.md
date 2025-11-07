@@ -8,7 +8,7 @@ This service fetches a strong baseline (default: Open-Meteo) and applies **per-v
 
 ```bash
 conda create -n wxplus python=3.11 -y && conda activate wxplus
-pip install -e . && pip install cdsapi pyarrow
+pip install -e .
 ```
 
 2. CDS API
@@ -21,7 +21,7 @@ pip install -e . && pip install cdsapi pyarrow
 
 ```
 bash scripts/global_fetch_and_train.sh
-python weather_plus/scripts/train_tiles.py
+python scripts/train_tiles.py
 ```
 
 4. Serve
