@@ -22,7 +22,7 @@ set -euo pipefail
 # -----------------------------
 # Config (env overridable)
 # -----------------------------
-START="${START:-2025-09-01T00:00}"
+START="${START:-2025-10-01T00:00}"
 END="${END:-2025-11-01T00:00}"
 
 LAT_STEPS="${LAT_STEPS:-7}"

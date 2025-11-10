@@ -3,22 +3,11 @@
 Robust ERA5-Land fetcher with month->day chunking, retries, validation, merging, and ZIP handling.
 Dataset: reanalysis-era5-land (hourly)
 
-Default variables (override with --var):
-- 2m_temperature
-- 2m_dewpoint_temperature
-- total_precipitation
-- volumetric_soil_water_layer_1..4
-- snow_depth
-- skin_temperature
-
-Key behaviors:
-- Splits large requests into months, then days if needed
-- Retries with exponential backoff on transient errors
-- Accepts NetCDF/HDF5 *and* ZIP responses; auto-extracts any .nc files
-- Merges valid parts with xarray (if available); otherwise leaves part files
-
-Requires a valid ~/.cdsapirc for cdsapi.Client.
+Fixes:
+- ZIP extraction uses unique, collision-proof filenames based on the part tag
+- Calendar-accurate day lists for month chunks
 """
+
 from __future__ import annotations
 
 import os
@@ -33,9 +22,6 @@ import cdsapi
 import zipfile
 from pathlib import Path
 
-# ---------------------------
-# Defaults (can override with --var ...)
-# ---------------------------
 DEFAULT_VARS = [
     "2m_temperature",
     "2m_dewpoint_temperature",
@@ -49,15 +35,9 @@ DEFAULT_VARS = [
 ]
 HOURS_ALL = [f"{h:02d}:00" for h in range(24)]
 
-# Magic headers for quick validation
-NETCDF_MAGIC_PREFIXES = (b"CDF",)  # classic/64-bit offset NetCDF
+NETCDF_MAGIC_PREFIXES = (b"CDF",)
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 ZIP_MAGIC = b"PK\x03\x04"
-
-
-# ---------------------------
-# Time helpers
-# ---------------------------
 
 
 def month_start(d: dt.datetime) -> dt.datetime:
@@ -115,11 +95,6 @@ def days_between(
     return res
 
 
-# ---------------------------
-# IO / logging
-# ---------------------------
-
-
 def part_name(out: str, tag: str) -> str:
     base, ext = os.path.splitext(out)
     if not ext:
@@ -129,11 +104,6 @@ def part_name(out: str, tag: str) -> str:
 
 def log(*args):
     print("[era5-land]", *args, flush=True)
-
-
-# ---------------------------
-# Validation & ZIP helpers
-# ---------------------------
 
 
 def _is_netcdf_or_hdf5_or_zip(path: str) -> bool:
@@ -150,7 +120,6 @@ def _is_netcdf_or_hdf5_or_zip(path: str) -> bool:
 
 
 def _weed_bad_parts(parts: List[str]) -> Tuple[List[str], List[str]]:
-    """Filter out zero-byte or non NetCDF/HDF5 parts. ZIPs should be expanded earlier."""
     good, bad = [], []
     for p in parts:
         try:
@@ -170,15 +139,29 @@ def _weed_bad_parts(parts: List[str]) -> Tuple[List[str], List[str]]:
     return good, bad
 
 
-def _safe_extract(
-    zf: zipfile.ZipFile, member: zipfile.ZipInfo, dest_dir: Path
+def _unique_path(dest_dir: Path, base_name: str) -> Path:
+    p = dest_dir / base_name
+    if not p.exists():
+        return p
+    stem, suffix = p.stem, p.suffix
+    k = 1
+    while True:
+        cand = dest_dir / f"{stem}__x{k:02d}{suffix}"
+        if not cand.exists():
+            return cand
+        k += 1
+
+
+def _safe_extract_with_tag(
+    zf: zipfile.ZipFile, member: zipfile.ZipInfo, dest_dir: Path, tag_stem: str
 ) -> Path | None:
-    """Extract a member safely (no path traversal), return the final file path inside dest_dir."""
-    base_name = os.path.basename(member.filename)
-    if not base_name:  # skip directories
+    base = os.path.basename(member.filename)
+    if not base:
         return None
-    final_path = dest_dir / base_name
-    tmp_path = dest_dir / (base_name + ".tmp_extract")
+    base_noext = os.path.splitext(base)[0]
+    out_name = f"{tag_stem}__{base_noext}.nc"
+    final_path = _unique_path(dest_dir, out_name)
+    tmp_path = final_path.with_suffix(final_path.suffix + ".tmp_extract")
     with zf.open(member, "r") as src, open(tmp_path, "wb") as dst:
         shutil.copyfileobj(src, dst)
     os.replace(tmp_path, final_path)
@@ -186,9 +169,6 @@ def _safe_extract(
 
 
 def _maybe_unzip_to_nc(path: str) -> List[str]:
-    """If 'path' is a ZIP (by magic bytes), extract contained .nc files next to it and
-    return their paths. If not a ZIP, return [path]. Keeps original ZIP file.
-    """
     try:
         with open(path, "rb") as f:
             head = f.read(4)
@@ -199,14 +179,19 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
 
     out_paths: List[str] = []
     dest_dir = Path(path).parent
+    tag_stem = Path(path).stem
+
     try:
         with zipfile.ZipFile(path, "r") as zf:
-            for m in zf.infolist():
-                if m.is_dir():
-                    continue
-                if not m.filename.lower().endswith(".nc"):
-                    continue
-                extracted = _safe_extract(zf, m, dest_dir)
+            members = [
+                m
+                for m in zf.infolist()
+                if not m.is_dir() and m.filename.lower().endswith(".nc")
+            ]
+            if not members:
+                return [path]
+            for m in members:
+                extracted = _safe_extract_with_tag(zf, m, dest_dir, tag_stem)
                 if extracted is not None:
                     out_paths.append(str(extracted))
     except zipfile.BadZipFile:
@@ -215,41 +200,22 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
     return out_paths if out_paths else [path]
 
 
-# ---------------------------
-# Request helpers
-# ---------------------------
-
-
 def hours_for_range(_: dt.datetime, __: dt.datetime) -> List[str]:
-    # ERA5-Land is hourly: just request all hours in the chunk.
     return HOURS_ALL
 
 
 def build_request(a: dt.datetime, b: dt.datetime, args, variables: List[str]) -> dict:
-    """
-    Build a CDS request describing [a, b). Because we chunk by month or day,
-    we can pass exact valid month/day lists to reduce overfetch and avoid invalid dates.
-    """
-    # inclusive upper bound for calendar selection
     end_inc = b - dt.timedelta(seconds=1)
-
     years = [f"{y:04d}" for y in range(a.year, end_inc.year + 1)]
     hours = hours_for_range(a, b)
 
     if a.year == end_inc.year and a.month == end_inc.month:
-        # Entire chunk stays within a single month
         months = [f"{a.month:02d}"]
-        if a.date() == end_inc.date():
-            # single day
-            days = [f"{a.day:02d}"]
-        else:
-            # multiple days within same month -> valid days for that month, clipped to [a,b)
-            ndays = calendar.monthrange(a.year, a.month)[1]
-            first_day = a.day
-            last_day = min(end_inc.day, ndays)
-            days = [f"{d:02d}" for d in range(first_day, last_day + 1)]
+        ndays = calendar.monthrange(a.year, a.month)[1]
+        first_day = a.day
+        last_day = min(end_inc.day, ndays)
+        days = [f"{d:02d}" for d in range(first_day, last_day + 1)]
     else:
-        # Spans multiple months/years (shouldn't happen with our chunking), keep robust
         months = [f"{m:02d}" for m in range(1, 13)]
         days = [f"{d:02d}" for d in range(1, 32)]
 
@@ -260,7 +226,7 @@ def build_request(a: dt.datetime, b: dt.datetime, args, variables: List[str]) ->
         "month": months,
         "day": days,
         "time": hours,
-        "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],  # N, W, S, E
+        "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],
         "format": "netcdf",
     }
 
@@ -273,13 +239,8 @@ def try_retrieve(
     max_retries: int,
     backoff: float,
 ) -> Tuple[bool, str]:
-    """
-    Returns (ok, err). For 403 'cost limits exceeded', caller should split smaller.
-    Accepts NetCDF/HDF5/ZIP; ZIPs are unzipped later.
-    """
     for k in range(max_retries + 1):
         try:
-            # Remove any pre-existing tiny/corrupt file before retry to avoid false positives
             if os.path.exists(target) and os.path.getsize(target) < 1024:
                 try:
                     os.remove(target)
@@ -288,7 +249,6 @@ def try_retrieve(
 
             c.retrieve(collection, request, target)
 
-            # Post-download validation: allow NetCDF/HDF5 or ZIP
             if (
                 os.path.exists(target)
                 and os.path.getsize(target) > 0
@@ -324,16 +284,10 @@ def try_retrieve(
     return False, "unknown"
 
 
-# ---------------------------
-# Merge
-# ---------------------------
-
-
 def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
 
-    # Expand any leftover ZIPs into .nc first (defensive)
     expanded: List[str] = []
     for p in parts:
         expanded.extend(_maybe_unzip_to_nc(p))
@@ -344,7 +298,6 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
 
-    # 1) header filter, move obvious non-NetCDF/HDF5 parts aside
     parts, bad = _weed_bad_parts(parts)
     for b in bad:
         log(f"warning: {b} is not NetCDF/HDF5 (moved to .bad)")
@@ -359,7 +312,6 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
     try:
         import xarray as xr
 
-        # 2) per-file open to isolate unreadables by engine
         good_parts: List[str] = []
         still_bad: List[Tuple[str, str]] = []
         for p in parts:
@@ -428,11 +380,6 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
         return False
 
 
-# ---------------------------
-# Main
-# ---------------------------
-
-
 def fetch_days_in_month(
     c: cdsapi.Client,
     am: dt.datetime,
@@ -447,7 +394,6 @@ def fetch_days_in_month(
     for ad, bd, tagd in days_between(am, bm):
         part_d = part_name(args.outfile, tagd)
         if os.path.exists(part_d) and os.path.getsize(part_d) > 0:
-            # Expand any existing ZIP into .nc if needed
             produced = _maybe_unzip_to_nc(part_d)
             if produced and all(os.path.exists(p) for p in produced):
                 log(f"skip existing day part {part_d}")
@@ -457,12 +403,7 @@ def fetch_days_in_month(
         reqd = build_request(ad, bd, args, variables)
         log(f"request day {tagd}")
         ok, err = try_retrieve(
-            c,
-            "reanalysis-era5-land",
-            reqd,
-            part_d,
-            max_retries,
-            backoff,
+            c, "reanalysis-era5-land", reqd, part_d, max_retries, backoff
         )
         if ok:
             produced = _maybe_unzip_to_nc(part_d)
@@ -505,7 +446,7 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.outfile) or ".", exist_ok=True)
-    c = cdsapi.Client()  # needs ~/.cdsapirc
+    c = cdsapi.Client()
 
     t0 = dt.datetime.fromisoformat(args.start)
     t1 = dt.datetime.fromisoformat(args.end)
@@ -531,7 +472,6 @@ def main():
                 sys.exit(2)
             continue
 
-        # Try whole month
         reqm = build_request(am, bm, args, variables)
         log(
             f"request month {tagm}  area(N,W,S,E)=({args.lat_max},{args.lon_min},{args.lat_min},{args.lon_max})"

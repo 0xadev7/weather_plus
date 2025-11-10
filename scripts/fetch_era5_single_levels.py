@@ -8,11 +8,10 @@ Variables:
 - surface_pressure, total_precipitation
 - 2m_temperature, 2m_dewpoint_temperature
 
-Key behaviors:
-- Splits large requests into months, then days if needed
-- Retries with exponential backoff on transient errors
-- Detects NetCDF/HDF5 *and* ZIP responses; unwraps ZIPs to .nc files
-- Merges all valid parts with xarray (if available), else leaves parts
+Key fixes in this version:
+- ZIP extraction now uses unique, collision-proof filenames based on the part tag
+- Month/day lists respect actual calendar days within [a,b)
+- Clearer merge logging
 
 Requires a valid ~/.cdsapirc for cdsapi.Client.
 """
@@ -23,6 +22,7 @@ import argparse
 import datetime as dt
 import time
 import sys
+import calendar
 from typing import List, Tuple
 import cdsapi
 import shutil
@@ -45,7 +45,6 @@ VARS = [
 ]
 
 HOURS_ALL = [f"{h:02d}:00" for h in range(24)]
-
 
 NETCDF_MAGIC = (b"CDF",)  # classic/64-bit offset start with 'CDF'
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
@@ -110,11 +109,7 @@ def clamp(a: dt.datetime, lo: dt.datetime, hi: dt.datetime) -> dt.datetime:
 
 
 def hours_for_range(a: dt.datetime, b: dt.datetime) -> List[str]:
-    """Return hour list for [a,b) aligned to whole hours in UTC.
-    cdsapi takes *hours* list only; requests are inclusive by calendar selection.
-    We include all hours present in the interval [a, b). If a/b are not on hour boundaries,
-    just include all 24 hours for the chunk to simplify (small overfetch is fine).
-    """
+    """Return hour list for [a,b); simplified to all hours for robustness."""
     return HOURS_ALL
 
 
@@ -137,13 +132,8 @@ def try_retrieve(
     max_retries: int,
     backoff: float,
 ) -> Tuple[bool, str]:
-    """
-    Returns (ok, err_msg). 'cost' for too-large requests. 'badfile' if the
-    server responded but the file is not NetCDF/HDF5/ZIP after all retries.
-    """
     for k in range(max_retries + 1):
         try:
-            # Remove any previous tiny/corrupt target so retries don't get fooled
             if os.path.exists(target) and os.path.getsize(target) < 1024:
                 try:
                     os.remove(target)
@@ -152,7 +142,6 @@ def try_retrieve(
 
             c.retrieve(collection, request, target)
 
-            # Post-download validation (accept NetCDF/HDF5 or ZIP)
             if (
                 os.path.exists(target)
                 and os.path.getsize(target) > 0
@@ -217,50 +206,75 @@ def days_between(
     return res
 
 
-def build_request(a: dt.datetime, b: dt.datetime, args) -> dict:
-    years = sorted({f"{y:04d}" for y in range(a.year, b.year + 1)})
-    # We pass exact months/days/hours covering [a,b). Simpler: full month/day lists for cross-boundary
-    months = [f"{m:02d}" for m in range(1, 13)]
-    days = [f"{d:02d}" for d in range(1, 32)]
-    hours = hours_for_range(a, b)
+def _build_month_day_lists(
+    a: dt.datetime, b_excl: dt.datetime
+) -> Tuple[List[str], List[str]]:
+    """
+    Return (months, days) to cover [a, b_excl) within calendar-valid ranges.
+    With our chunking, [a,b_excl) should be within one month; handle cross-month defensively.
+    """
+    end_inc = b_excl - dt.timedelta(seconds=1)
+    if a.year == end_inc.year and a.month == end_inc.month:
+        months = [f"{a.month:02d}"]
+        ndays = calendar.monthrange(a.year, a.month)[1]
+        first_day = a.day
+        last_day = min(end_inc.day, ndays)
+        days = [f"{d:02d}" for d in range(first_day, last_day + 1)]
+    else:
+        # Very rare for our chunking; fall back to broad but valid selections
+        months = [f"{m:02d}" for m in range(1, 13)]
+        days = [f"{d:02d}" for d in range(1, 32)]
+    return months, days
 
+
+def build_request(a: dt.datetime, b: dt.datetime, args) -> dict:
+    years = [f"{y:04d}" for y in range(a.year, (b - dt.timedelta(seconds=1)).year + 1)]
+    hours = hours_for_range(a, b)
+    months, days = _build_month_day_lists(a, b)
     return {
         "product_type": "reanalysis",
         "variable": VARS,
         "year": years,
-        "month": (
-            months if (a.month != b.month or a.year != b.year) else [f"{a.month:02d}"]
-        ),
-        "day": (
-            days
-            if (a.date() != (b - dt.timedelta(days=1)).date())
-            else [f"{a.day:02d}"]
-        ),
+        "month": months,
+        "day": days,
         "time": hours,
         "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],  # N, W, S, E
         "format": "netcdf",
-        "expver": ["1", "5"],  # request both; CDS may deliver ZIP
+        "expver": ["1", "5"],  # may trigger ZIP response with multiple streams
     }
 
 
 # ---------------------------
-# ZIP handling
+# ZIP handling (collision-proof)
 # ---------------------------
 
 
-def _safe_extract(zf: zipfile.ZipFile, member: zipfile.ZipInfo, dest_dir: Path) -> Path:
-    """Extract a member safely (no path traversal), return the final file path inside dest_dir."""
-    # Normalize member name
-    name = member.filename
-    # Strip directories to avoid writing outside dest_dir
-    base_name = os.path.basename(name)
-    if not base_name:
-        # skip directories
-        return None  # type: ignore
-    # Final path inside destination directory
-    final_path = dest_dir / base_name
-    # Extract to a temp name then move to final_path (ensures overwrite semantics)
-    tmp_path = dest_dir / (base_name + ".tmp_extract")
+def _unique_path(dest_dir: Path, base_name: str) -> Path:
+    p = dest_dir / base_name
+    if not p.exists():
+        return p
+    stem = p.stem
+    suffix = p.suffix
+    k = 1
+    while True:
+        cand = dest_dir / f"{stem}__x{k:02d}{suffix}"
+        if not cand.exists():
+            return cand
+        k += 1
+
+
+def _safe_extract_with_tag(
+    zf: zipfile.ZipFile, member: zipfile.ZipInfo, dest_dir: Path, tag_stem: str
+) -> Path | None:
+    """Extract member safely into dest_dir using a unique name including tag_stem."""
+    base = os.path.basename(member.filename)
+    if not base:
+        return None
+    # Force .nc extension and inject the part tag to avoid collisions
+    base_noext = os.path.splitext(base)[0]
+    out_name = f"{tag_stem}__{base_noext}.nc"
+    final_path = _unique_path(dest_dir, out_name)
+    tmp_path = final_path.with_suffix(final_path.suffix + ".tmp_extract")
     with zf.open(member, "r") as src, open(tmp_path, "wb") as dst:
         shutil.copyfileobj(src, dst)
     os.replace(tmp_path, final_path)
@@ -268,11 +282,9 @@ def _safe_extract(zf: zipfile.ZipFile, member: zipfile.ZipInfo, dest_dir: Path) 
 
 
 def _maybe_unzip_to_nc(path: str) -> List[str]:
-    """If 'path' is a ZIP (by magic bytes), extract contained .nc files next to it and
-    return their paths. If not a ZIP, return [path] as-is.
-
-    The CDS sometimes returns a ZIP even if target name ends with .nc. We ignore the
-    original extension and check the magic bytes.
+    """
+    If 'path' is a ZIP, extract contained .nc files next to it using a unique, tag-based filename.
+    If not a ZIP, return [path].
     """
     try:
         with open(path, "rb") as f:
@@ -284,6 +296,7 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
 
     out_paths: List[str] = []
     dest_dir = Path(path).parent
+    tag_stem = Path(path).stem  # includes ".part_YYYYMMDD" etc.
 
     try:
         with zipfile.ZipFile(path, "r") as zf:
@@ -292,18 +305,17 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
                 for m in zf.infolist()
                 if not m.is_dir() and m.filename.lower().endswith(".nc")
             ]
+            if not members:
+                # keep original so caller can decide
+                return [path]
             for m in members:
-                extracted = _safe_extract(zf, m, dest_dir)
+                extracted = _safe_extract_with_tag(zf, m, dest_dir, tag_stem)
                 if extracted is not None:
                     out_paths.append(str(extracted))
     except zipfile.BadZipFile:
-        # Not a valid zip after all; return as-is
         return [path]
 
-    # Keep the original ZIP (which may have .nc extension) for provenance; comment next line to delete
-    # os.remove(path)
-
-    # If no .nc files were found, keep the original path so the caller can handle it
+    # Keep the original ZIP (which might have .nc extension) for provenance
     return out_paths if out_paths else [path]
 
 
@@ -342,16 +354,13 @@ def main():
     part_paths: List[str] = []
 
     for am, bm, tagm in chunks_m:
-        # Skip if a merged part already exists (month-level)
         part_m = part_name(args.outfile, tagm)
         if os.path.exists(part_m) and os.path.getsize(part_m) > 0:
             log(f"skip existing month part {part_m}")
-            # Expand any zips (if previous run saved a zip with .nc name)
             part_paths.extend(_maybe_unzip_to_nc(part_m))
             continue
 
         if args.granularity in ("day",):
-            # Force day-level immediately
             ok = fetch_days_in_month(c, am, bm, args, part_paths)
             if not ok:
                 sys.exit(2)
@@ -438,12 +447,10 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
 
-    # Expand any leftover zips into .nc first (defensive if caller forgot)
     expanded: List[str] = []
     for p in parts:
         expanded.extend(_maybe_unzip_to_nc(p))
 
-    # 1) quick header filter
     parts = sorted(
         {p for p in expanded if os.path.exists(p) and os.path.getsize(p) > 0}
     )
@@ -461,28 +468,26 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
     try:
         import xarray as xr
 
-        # 2) pinpoint files that still fail to open
         good_parts = []
         still_bad = []
         for p in parts:
-            try:
-                xr.open_dataset(p, engine="netcdf4").close()
+            opened = False
+            for eng in ("netcdf4", "h5netcdf", "scipy"):
+                try:
+                    xr.open_dataset(p, engine=eng).close()
+                    opened = True
+                    break
+                except Exception:
+                    continue
+            if opened:
                 good_parts.append(p)
-                continue
-            except Exception:
-                pass
-            try:
-                xr.open_dataset(p, engine="h5netcdf").close()
-                good_parts.append(p)
-                continue
-            except Exception:
-                pass
-            try:
-                xr.open_dataset(p, engine="scipy").close()
-                good_parts.append(p)
-                continue
-            except Exception as e:
-                still_bad.append((p, f"{e.__class__.__name__}: {e}"))
+            else:
+                try:
+                    xr.open_dataset(p).close()
+                except Exception as e:
+                    still_bad.append((p, f"{e.__class__.__name__}: {e}"))
+                else:
+                    good_parts.append(p)
 
         for p, emsg in still_bad:
             log(f"warning: {p} unreadable by xarray ({emsg}); moved to .bad")
@@ -497,6 +502,7 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
         log(f"merging {len(good_parts)} parts")
         ds = None
         last_err = None
+        write_engine = None
         for eng in ("netcdf4", "h5netcdf", "scipy"):
             try:
                 ds = xr.open_mfdataset(
@@ -506,7 +512,7 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
                     parallel=False,
                     decode_times=True,
                 )
-                write_engine = eng  # use a matching writer
+                write_engine = eng
                 break
             except Exception as e:
                 last_err = e
@@ -517,7 +523,10 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
         if "time" in ds:
             ds = ds.sortby("time")
         tmp = outfile + ".tmp"
-        ds.to_netcdf(tmp, engine=write_engine)  # type: ignore
+        if write_engine in ("netcdf4", "h5netcdf"):
+            ds.to_netcdf(tmp, engine=write_engine)
+        else:
+            ds.to_netcdf(tmp)
         ds.close()
         os.replace(tmp, outfile)
         return True
