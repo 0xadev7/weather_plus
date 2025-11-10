@@ -13,6 +13,7 @@ from __future__ import annotations
 import os, argparse, datetime as dt, time, sys
 from typing import List, Tuple
 import cdsapi
+import shutil
 
 # ---------------------------
 # Helpers
@@ -30,6 +31,29 @@ VARS = [
 ]
 
 HOURS_ALL = [f"{h:02d}:00" for h in range(24)]
+
+
+NETCDF_MAGIC = (b"CDF",)  # classic/64-bit offset start with 'CDF'
+HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+
+
+def _is_netcdf_or_hdf5(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+        return head.startswith(NETCDF_MAGIC) or head.startswith(HDF5_MAGIC)
+    except Exception:
+        return False
+
+
+def _weed_bad_parts(parts: List[str]) -> Tuple[List[str], List[str]]:
+    good, bad = [], []
+    for p in parts:
+        if os.path.getsize(p) == 0 or not _is_netcdf_or_hdf5(p):
+            bad.append(p)
+        else:
+            good.append(p)
+    return good, bad
 
 
 def month_start(d: dt.datetime) -> dt.datetime:
@@ -295,22 +319,62 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
     parts = sorted({p for p in parts if os.path.exists(p) and os.path.getsize(p) > 0})
+
+    # 1) quick header filter
+    parts, bad = _weed_bad_parts(parts)
+    for b in bad:
+        log(f"warning: {b} is not NetCDF/HDF5 (moved to .bad)")
+        shutil.move(b, b + ".bad")
+
     if not parts:
         return False
+
     try:
         import xarray as xr
 
-        log(f"merging {len(parts)} parts")
-        # Try engines in order; pinning avoids xarray's guesser error.
-        for eng in ("netcdf4", "scipy", "h5netcdf"):
+        # 2) pinpoint files that still fail to open
+        good_parts = []
+        still_bad = []
+        for p in parts:
+            try:
+                xr.open_dataset(p, engine="netcdf4").close()
+                good_parts.append(p)
+                continue
+            except Exception:
+                pass
+            try:
+                xr.open_dataset(p, engine="h5netcdf").close()
+                good_parts.append(p)
+                continue
+            except Exception:
+                pass
+            try:
+                xr.open_dataset(p, engine="scipy").close()
+                good_parts.append(p)
+                continue
+            except Exception as e:
+                still_bad.append((p, f"{e.__class__.__name__}: {e}"))
+
+        for p, emsg in still_bad:
+            log(f"warning: {p} unreadable by xarray ({emsg}); moved to .bad")
+            shutil.move(p, p + ".bad")
+
+        if not good_parts:
+            return False
+
+        log(f"merging {len(good_parts)} parts")
+        ds = None
+        last_err = None
+        for eng in ("netcdf4", "h5netcdf", "scipy"):
             try:
                 ds = xr.open_mfdataset(
-                    parts,
+                    good_parts,
                     combine="by_coords",
-                    engine=eng,  # <-- important
+                    engine=eng,
                     parallel=False,
                     decode_times=True,
                 )
+                write_engine = eng  # use a matching writer
                 break
             except Exception as e:
                 last_err = e
@@ -321,7 +385,7 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
         if "time" in ds:
             ds = ds.sortby("time")
         tmp = outfile + ".tmp"
-        ds.to_netcdf(tmp, engine=eng)
+        ds.to_netcdf(tmp, engine=write_engine)
         ds.close()
         os.replace(tmp, outfile)
         return True

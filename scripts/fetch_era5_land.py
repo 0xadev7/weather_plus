@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-Robust ERA5-Land fetcher with month->day chunking, retries, and merging.
-Dataset: reanalysis-era5-land  (hourly)
+Robust ERA5-Land fetcher with month->day chunking, retries, validation, and merging.
+Dataset: reanalysis-era5-land (hourly)
 
 Default variables (override with --var):
 - 2m_temperature
@@ -13,7 +13,7 @@ Default variables (override with --var):
 """
 from __future__ import annotations
 
-import os, argparse, datetime as dt, time, sys
+import os, argparse, datetime as dt, time, sys, calendar, shutil
 from typing import List, Tuple
 import cdsapi
 
@@ -32,6 +32,10 @@ DEFAULT_VARS = [
     "skin_temperature",
 ]
 HOURS_ALL = [f"{h:02d}:00" for h in range(24)]
+
+# NetCDF/HDF5 "magic" for quick header validation
+NETCDF_MAGIC_PREFIXES = (b"CDF",)  # classic/64-bit offset NetCDF
+HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 
 
 # ---------------------------
@@ -107,31 +111,67 @@ def log(*args):
 
 
 # ---------------------------
+# Validation helpers
+# ---------------------------
+def _is_netcdf_or_hdf5(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+        if head.startswith(HDF5_MAGIC):
+            return True
+        return any(head.startswith(p) for p in NETCDF_MAGIC_PREFIXES)
+    except Exception:
+        return False
+
+
+def _weed_bad_parts(parts: List[str]) -> Tuple[List[str], List[str]]:
+    good, bad = [], []
+    for p in parts:
+        try:
+            if os.path.getsize(p) == 0 or not _is_netcdf_or_hdf5(p):
+                bad.append(p)
+            else:
+                good.append(p)
+        except Exception:
+            bad.append(p)
+    return good, bad
+
+
+# ---------------------------
 # Request helpers
 # ---------------------------
 def hours_for_range(_: dt.datetime, __: dt.datetime) -> List[str]:
-    return HOURS_ALL  # simple & safe (hourly dataset)
+    # ERA5-Land is hourly: just request all hours in the chunk.
+    return HOURS_ALL
 
 
 def build_request(a: dt.datetime, b: dt.datetime, args, variables: List[str]) -> dict:
-    # Make the end inclusive for calendar fields
+    """
+    Build a CDS request describing [a, b). Because we chunk by month or day,
+    we can pass exact valid month/day lists to reduce overfetch and avoid invalid dates.
+    """
+    # inclusive upper bound for calendar selection
     end_inc = b - dt.timedelta(seconds=1)
 
-    # Years covered by [a, b)
     years = [f"{y:04d}" for y in range(a.year, end_inc.year + 1)]
+    hours = hours_for_range(a, b)
 
-    # Default: exact month/day
-    months = [f"{a.month:02d}"]
-    days = [f"{a.day:02d}"]
-
-    hours = hours_for_range(a, b)  # hourly dataset → all hours
-
-    # If the chunk spans multiple months, loosen month selector
-    if a.year != end_inc.year or a.month != end_inc.month:
+    if a.year == end_inc.year and a.month == end_inc.month:
+        # Entire chunk stays within a single month
+        months = [f"{a.month:02d}"]
+        if a.date() == end_inc.date():
+            # single day
+            days = [f"{a.day:02d}"]
+        else:
+            # multiple days within same month -> valid days for that month, clipped to [a,b)
+            ndays = calendar.monthrange(a.year, a.month)[1]
+            first_day = a.day
+            last_day = min(end_inc.day, ndays)
+            days = [f"{d:02d}" for d in range(first_day, last_day + 1)]
+    else:
+        # Spans multiple months/years (shouldn't happen with our chunking,
+        # but keep it robust): broaden months and days to valid sets.
         months = [f"{m:02d}" for m in range(1, 13)]
-
-    # If the chunk spans multiple days, loosen day selector
-    if a.date() != end_inc.date():
         days = [f"{d:02d}" for d in range(1, 32)]
 
     return {
@@ -156,17 +196,44 @@ def try_retrieve(
 ) -> Tuple[bool, str]:
     """
     Returns (ok, err). For 403 'cost limits exceeded', caller should split smaller.
+    After download, validates that 'target' looks like a NetCDF/HDF5 file. If not,
+    retries (treated as transient) and finally returns 'badfile'.
     """
     for k in range(max_retries + 1):
         try:
+            # Remove any pre-existing tiny/corrupt file before retry to avoid false positives
+            if os.path.exists(target) and os.path.getsize(target) < 1024:
+                try:
+                    os.remove(target)
+                except Exception:
+                    pass
+
             c.retrieve(collection, request, target)
-            return True, ""
+
+            # Post-download validation
+            if (
+                os.path.exists(target)
+                and os.path.getsize(target) > 0
+                and _is_netcdf_or_hdf5(target)
+            ):
+                return True, ""
+            else:
+                if k == max_retries:
+                    return False, "badfile"
+                sleep_s = backoff * (2**k)
+                log(
+                    f"warn: downloaded file invalid, retry {k+1}/{max_retries} in {sleep_s:.1f}s"
+                )
+                time.sleep(sleep_s)
+                continue
+
         except Exception as e:
             msg = str(e)
             if (
                 "cost limits exceeded" in msg
                 or "Request too large" in msg
                 or "413" in msg
+                or "Payload Too Large" in msg
             ):
                 return False, "cost"
             if k == max_retries:
@@ -185,20 +252,89 @@ def try_retrieve(
 def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
-    parts = sorted(
-        set(p for p in parts if os.path.exists(p) and os.path.getsize(p) > 0)
-    )
+    parts = sorted({p for p in parts if os.path.exists(p) and os.path.getsize(p) > 0})
     if not parts:
         return False
+
+    # 1) header filter, move obvious non-NetCDF/HDF5 parts aside
+    parts, bad = _weed_bad_parts(parts)
+    for b in bad:
+        log(f"warning: {b} is not NetCDF/HDF5 (moved to .bad)")
+        try:
+            shutil.move(b, b + ".bad")
+        except Exception:
+            pass
+
+    if not parts:
+        return False
+
     try:
         import xarray as xr
 
-        log(f"merging {len(parts)} parts")
-        ds = xr.open_mfdataset(parts, combine="by_coords")
+        # 2) per-file open to isolate unreadables by engine
+        good_parts: List[str] = []
+        still_bad: List[Tuple[str, str]] = []
+        for p in parts:
+            opened = False
+            for eng in ("netcdf4", "h5netcdf", "scipy"):
+                try:
+                    xr.open_dataset(p, engine=eng).close()
+                    opened = True
+                    break
+                except Exception:
+                    continue
+            if opened:
+                good_parts.append(p)
+            else:
+                # capture an error message using a final attempt
+                try:
+                    xr.open_dataset(p).close()
+                except Exception as e:
+                    still_bad.append((p, f"{e.__class__.__name__}: {e}"))
+                else:
+                    # shouldn't happen, but treat as good if it did open
+                    good_parts.append(p)
+
+        for p, emsg in still_bad:
+            log(f"warning: {p} unreadable by xarray ({emsg}); moved to .bad")
+            try:
+                shutil.move(p, p + ".bad")
+            except Exception:
+                pass
+
+        if not good_parts:
+            return False
+
+        log(f"merging {len(good_parts)} parts")
+        ds = None
+        last_err = None
+        write_engine = None
+        for eng in ("netcdf4", "h5netcdf", "scipy"):
+            try:
+                ds = xr.open_mfdataset(
+                    good_parts,
+                    combine="by_coords",
+                    engine=eng,
+                    parallel=False,
+                    decode_times=True,
+                )
+                write_engine = eng
+                break
+            except Exception as e:
+                last_err = e
+                ds = None
+        if ds is None:
+            raise last_err
+
         if "time" in ds:
             ds = ds.sortby("time")
+
         tmp = outfile + ".tmp"
-        ds.to_netcdf(tmp)
+        # Write with the same backend we used to open, when possible
+        if write_engine in ("netcdf4", "h5netcdf"):
+            ds.to_netcdf(tmp, engine=write_engine)
+        else:
+            ds.to_netcdf(tmp)
         ds.close()
         os.replace(tmp, outfile)
         return True
@@ -223,7 +359,11 @@ def fetch_days_in_month(
     ok_any = False
     for ad, bd, tagd in days_between(am, bm):
         part_d = part_name(args.outfile, tagd)
-        if os.path.exists(part_d) and os.path.getsize(part_d) > 0:
+        if (
+            os.path.exists(part_d)
+            and os.path.getsize(part_d) > 0
+            and _is_netcdf_or_hdf5(part_d)
+        ):
             log(f"skip existing day part {part_d}")
             part_paths.append(part_d)
             ok_any = True
@@ -284,7 +424,11 @@ def main():
     parts: List[str] = []
     for am, bm, tagm in months_between(t0, t1):
         part_m = part_name(args.outfile, tagm)
-        if os.path.exists(part_m) and os.path.getsize(part_m) > 0:
+        if (
+            os.path.exists(part_m)
+            and os.path.getsize(part_m) > 0
+            and _is_netcdf_or_hdf5(part_m)
+        ):
             log(f"skip existing month part {part_m}")
             parts.append(part_m)
             continue
@@ -300,7 +444,7 @@ def main():
         # Try whole month
         reqm = build_request(am, bm, args, variables)
         log(
-            f"request month {tagm} area=({args.lat_min},{args.lat_max},{args.lon_min},{args.lon_max})"
+            f"request month {tagm}  area=({args.lat_min},{args.lat_max},{args.lon_min},{args.lon_max})"
         )
         ok, err = try_retrieve(
             c, "reanalysis-era5-land", reqm, part_m, args.max_retries, args.backoff
@@ -327,7 +471,7 @@ def main():
         print("Saved", args.outfile)
     else:
         log(
-            "xarray not available; kept part files. Install xarray/netCDF4 to auto-merge."
+            "xarray not available or parts invalid; kept part files. Install xarray/netCDF4/h5netcdf to auto-merge."
         )
         print(f"Saved {len(parts)} part files")
 
