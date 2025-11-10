@@ -41,7 +41,7 @@ def _is_netcdf_or_hdf5(path: str) -> bool:
     try:
         with open(path, "rb") as f:
             head = f.read(8)
-        return head.startswith(NETCDF_MAGIC) or head.startswith(HDF5_MAGIC)
+        return head.startswith(HDF5_MAGIC) or head.startswith(NETCDF_MAGIC)
     except Exception:
         return False
 
@@ -110,19 +110,43 @@ def try_retrieve(
     backoff: float,
 ) -> Tuple[bool, str]:
     """
-    Returns (ok, err_msg). For 403 'cost limits exceeded', caller may decide to split smaller.
+    Returns (ok, err_msg). 'cost' for too-large requests. 'badfile' if the
+    server responded but the file is not NetCDF/HDF5 after all retries.
     """
     for k in range(max_retries + 1):
         try:
+            # Remove any previous tiny/corrupt target so retries don't get fooled
+            if os.path.exists(target) and os.path.getsize(target) < 1024:
+                try:
+                    os.remove(target)
+                except Exception:
+                    pass
+
             c.retrieve(collection, request, target)
-            return True, ""
+
+            # Post-download validation
+            if (
+                os.path.exists(target)
+                and os.path.getsize(target) > 0
+                and _is_netcdf_or_hdf5(target)
+            ):
+                return True, ""
+
+            if k == max_retries:
+                return False, "badfile"
+
+            sleep_s = backoff * (2**k)
+            log(
+                f"warn: downloaded file invalid, retry {k+1}/{max_retries} in {sleep_s:.1f}s"
+            )
+            time.sleep(sleep_s)
+
         except Exception as e:
             msg = str(e)
-            # Detect common cases
             if (
-                "cost limits exceeded" in msg
-                or "Request too large" in msg
-                or "413" in msg
+                ("cost limits exceeded" in msg)
+                or ("Request too large" in msg)
+                or ("413" in msg)
             ):
                 return False, "cost"
             if k == max_retries:
@@ -172,7 +196,7 @@ def build_request(a: dt.datetime, b: dt.datetime, args) -> dict:
     days = [f"{d:02d}" for d in range(1, 32)]
     hours = hours_for_range(a, b)
 
-    req = {
+    return {
         "product_type": "reanalysis",
         "variable": VARS,
         "year": years,
@@ -187,8 +211,8 @@ def build_request(a: dt.datetime, b: dt.datetime, args) -> dict:
         "time": hours,
         "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],  # N, W, S, E
         "format": "netcdf",
+        "expver": ["1", "5"],  # <--- key line to get ERA5T + consolidated
     }
-    return req
 
 
 # ---------------------------
