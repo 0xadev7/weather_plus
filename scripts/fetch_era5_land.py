@@ -114,15 +114,24 @@ def hours_for_range(_: dt.datetime, __: dt.datetime) -> List[str]:
 
 
 def build_request(a: dt.datetime, b: dt.datetime, args, variables: List[str]) -> dict:
-    years = sorted({f"{y:04d}" for y in range(a.year, b.year + 1)})
-    months = [f"{m:02d}"]
-    days = [f"{d:02d}"]
-    hours = hours_for_range(a, b)
+    # Make the end inclusive for calendar fields
+    end_inc = b - dt.timedelta(seconds=1)
 
-    # If the chunk spans >1 month/day, broaden selectors (CDS accepts lists)
-    if a.year != b.year or a.month != b.month:
+    # Years covered by [a, b)
+    years = [f"{y:04d}" for y in range(a.year, end_inc.year + 1)]
+
+    # Default: exact month/day
+    months = [f"{a.month:02d}"]
+    days = [f"{a.day:02d}"]
+
+    hours = hours_for_range(a, b)  # hourly dataset → all hours
+
+    # If the chunk spans multiple months, loosen month selector
+    if a.year != end_inc.year or a.month != end_inc.month:
         months = [f"{m:02d}" for m in range(1, 13)]
-    if a.date() != (b - dt.timedelta(days=1)).date():
+
+    # If the chunk spans multiple days, loosen day selector
+    if a.date() != end_inc.date():
         days = [f"{d:02d}" for d in range(1, 32)]
 
     return {
