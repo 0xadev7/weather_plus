@@ -294,21 +294,34 @@ def fetch_days_in_month(
 def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
-    parts = sorted(
-        set(p for p in parts if os.path.exists(p) and os.path.getsize(p) > 0)
-    )
+    parts = sorted({p for p in parts if os.path.exists(p) and os.path.getsize(p) > 0})
     if not parts:
         return False
     try:
         import xarray as xr
 
         log(f"merging {len(parts)} parts")
-        ds = xr.open_mfdataset(parts, combine="by_coords")
-        # Sort by time if present
+        # Try engines in order; pinning avoids xarray's guesser error.
+        for eng in ("netcdf4", "scipy", "h5netcdf"):
+            try:
+                ds = xr.open_mfdataset(
+                    parts,
+                    combine="by_coords",
+                    engine=eng,  # <-- important
+                    parallel=False,
+                    decode_times=True,
+                )
+                break
+            except Exception as e:
+                last_err = e
+                ds = None
+        if ds is None:
+            raise last_err
+
         if "time" in ds:
             ds = ds.sortby("time")
         tmp = outfile + ".tmp"
-        ds.to_netcdf(tmp)
+        ds.to_netcdf(tmp, engine=eng)
         ds.close()
         os.replace(tmp, outfile)
         return True
