@@ -3,12 +3,14 @@
 Robust ERA5-Land fetcher with month->day chunking, retries, validation, merging, and ZIP handling.
 Dataset: reanalysis-era5-land (hourly)
 
-Improvements:
-- ZIP extraction uses unique, collision-proof filenames based on the part tag
-- Calendar-accurate day lists for month chunks
-- Deep xarray merge diagnostics with --debug-merge
-- Optional pruning of merged parts/ZIPs with --prune-parts
-- Batch-wise combine_by_coords to reduce memory/locking issues
+Fixes in this revision:
+- Normalize per-file datasets:
+  * rename short-coded vars (t2m,d2m,tp,swvl1–4,skt,sde) → long names requested
+  * rename 'valid_time' → 'time'
+  * squeeze expver/number, sort+dedup time
+- Use xr.merge (union of variables) instead of combine_by_coords, so parts that split
+  variables across files can be merged correctly.
+- Preflight shows both raw and remapped variable names.
 """
 
 from __future__ import annotations
@@ -46,6 +48,19 @@ ZIP_MAGIC = b"PK\x03\x04"
 
 # ZIPs seen (so we can prune after merge if asked)
 _SEEN_ZIPS: Set[str] = set()
+
+# Short→long mapping used by CDS files
+SHORT_TO_LONG = {
+    "t2m": "2m_temperature",
+    "d2m": "2m_dewpoint_temperature",
+    "tp": "total_precipitation",
+    "swvl1": "volumetric_soil_water_layer_1",
+    "swvl2": "volumetric_soil_water_layer_2",
+    "swvl3": "volumetric_soil_water_layer_3",
+    "swvl4": "volumetric_soil_water_layer_4",
+    "sde": "snow_depth",
+    "skt": "skin_temperature",
+}
 
 
 def month_start(d: dt.datetime) -> dt.datetime:
@@ -184,13 +199,10 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
             return [path]
     except Exception:
         return [path]
-
     _SEEN_ZIPS.add(path)
-
     out_paths: List[str] = []
     dest_dir = Path(path).parent
     tag_stem = Path(path).stem
-
     try:
         with zipfile.ZipFile(path, "r") as zf:
             members = [
@@ -206,7 +218,6 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
                     out_paths.append(str(extracted))
     except zipfile.BadZipFile:
         return [path]
-
     return out_paths if out_paths else [path]
 
 
@@ -218,7 +229,6 @@ def build_request(a: dt.datetime, b: dt.datetime, args, variables: List[str]) ->
     end_inc = b - dt.timedelta(seconds=1)
     years = [f"{y:04d}" for y in range(a.year, end_inc.year + 1)]
     hours = hours_for_range(a, b)
-
     if a.year == end_inc.year and a.month == end_inc.month:
         months = [f"{a.month:02d}"]
         ndays = calendar.monthrange(a.year, a.month)[1]
@@ -228,7 +238,6 @@ def build_request(a: dt.datetime, b: dt.datetime, args, variables: List[str]) ->
     else:
         months = [f"{m:02d}" for m in range(1, 13)]
         days = [f"{d:02d}" for d in range(1, 32)]
-
     return {
         "product_type": "reanalysis",
         "variable": variables,
@@ -256,25 +265,20 @@ def try_retrieve(
                     os.remove(target)
                 except Exception:
                     pass
-
             c.retrieve(collection, request, target)
-
             if (
                 os.path.exists(target)
                 and os.path.getsize(target) > 0
                 and _is_netcdf_or_hdf5_or_zip(target)
             ):
                 return True, ""
-
             if k == max_retries:
                 return False, "badfile"
-
             sleep_s = backoff * (2**k)
             log(
                 f"warn: downloaded file invalid, retry {k+1}/{max_retries} in {sleep_s:.1f}s"
             )
             time.sleep(sleep_s)
-
         except Exception as e:
             msg = str(e)
             if (
@@ -318,17 +322,20 @@ def _preflight_report(paths: List[str], engines: Dict[str, str], debug: bool):
         import numpy as np  # noqa
     except Exception:
         return
-    all_vars: Set[str] = set()
+    all_vars_raw: Set[str] = set()
+    all_vars_remap: Set[str] = set()
     per_file_vars: Dict[str, Set[str]] = {}
     lat_names, lon_names = set(), set()
-    shown = 0
     for p in paths:
         try:
             ds = xr.open_dataset(
                 p, engine=engines[p], decode_times=True, chunks={}, cache=False
             )
-            all_vars |= set(ds.data_vars)
-            per_file_vars[p] = set(ds.data_vars)
+            all_vars_raw |= set(ds.data_vars)
+            # simulate remap view
+            remapped = set(SHORT_TO_LONG.get(v, v) for v in ds.data_vars)
+            all_vars_remap |= remapped
+            per_file_vars[p] = remapped
             if debug:
                 log("open:", _brief_ds_summary(ds, p), f" engine={engines[p]}")
             for cand in ("latitude", "lat", "y"):
@@ -340,21 +347,66 @@ def _preflight_report(paths: List[str], engines: Dict[str, str], debug: bool):
             ds.close()
         except Exception as e:
             log(f"warning: preflight could not open {p}: {e}")
-        shown += 1
-        if debug and shown % 25 == 0:
-            log(f"preflight: scanned {shown}/{len(paths)} files")
     if debug:
-        log(f"preflight: union vars = {sorted(all_vars)}")
+        log(f"preflight: union raw vars = {sorted(all_vars_raw)}")
+        log(f"preflight: union remapped vars = {sorted(all_vars_remap)}")
         for p in paths[:10]:
             missing = [v for v in DEFAULT_VARS if v not in per_file_vars.get(p, set())]
             if missing:
-                log(f"preflight: {os.path.basename(p)} missing variables: {missing}")
+                log(
+                    f"preflight: {os.path.basename(p)} missing (after remap): {missing}"
+                )
         log(
             f"preflight: latitude coord names seen: {sorted(lat_names)}; longitude coord names seen: {sorted(lon_names)}"
         )
 
 
-# ---------- Merge (batch + verbose) ----------
+# ---------- Normalize + Merge ----------
+
+
+def _open_and_normalize(path: str):
+    import xarray as xr
+    import numpy as np
+
+    last = None
+    for eng in ("netcdf4", "h5netcdf", "scipy"):
+        try:
+            ds = xr.open_dataset(
+                path,
+                engine=eng,
+                decode_times=True,
+                chunks={},
+                mask_and_scale=True,
+                use_cftime=None,
+                cache=False,
+            )
+            # Coords: valid_time → time
+            if "valid_time" in ds.coords and "time" not in ds.coords:
+                ds = ds.rename({"valid_time": "time"})
+            # Remove ensemble/expver dims if present
+            for dim in ("expver", "number"):
+                if dim in ds.dims and ds.sizes.get(dim, 1) > 1:
+                    ds = ds.isel({dim: 0})
+                if dim in ds.dims and ds.sizes.get(dim, 1) == 1:
+                    ds = ds.squeeze(dim, drop=True)
+            # Dedup/sort time
+            if "time" in ds:
+                try:
+                    ds = ds.sortby("time")
+                    vals = ds["time"].values
+                    _, idx = np.unique(vals, return_index=True)
+                    if len(idx) != ds.sizes.get("time", len(idx)):
+                        ds = ds.isel(time=sorted(idx))
+                except Exception:
+                    pass
+            # Rename variables to requested long names
+            rename_map = {k: v for k, v in SHORT_TO_LONG.items() if k in ds.data_vars}
+            if rename_map:
+                ds = ds.rename(rename_map)
+            return ds, eng
+        except Exception as e:
+            last = e
+    raise last if last else RuntimeError("failed to open dataset")
 
 
 def merge_parts(
@@ -367,7 +419,6 @@ def merge_parts(
     expanded: List[str] = []
     for p in parts:
         expanded.extend(_maybe_unzip_to_nc(p))
-
     parts = sorted(
         {p for p in expanded if os.path.exists(p) and os.path.getsize(p) > 0}
     )
@@ -384,38 +435,6 @@ def merge_parts(
     if not parts:
         return False, []
 
-    # Helper to open with fallback engines and clean times
-    def _open_clean(path: str):
-        import xarray as xr
-
-        last = None
-        for eng in ("netcdf4", "h5netcdf", "scipy"):
-            try:
-                ds = xr.open_dataset(
-                    path,
-                    engine=eng,
-                    decode_times=True,
-                    chunks={},  # avoid huge dask graphs
-                    mask_and_scale=True,
-                    use_cftime=None,
-                    cache=False,
-                )
-                if "time" in ds:
-                    try:
-                        ds = ds.sortby("time")
-                        import numpy as np  # local
-
-                        vals = ds["time"].values
-                        _, idx = np.unique(vals, return_index=True)
-                        if len(idx) != ds.sizes.get("time", len(idx)):
-                            ds = ds.isel(time=sorted(idx))
-                    except Exception:
-                        pass
-                return ds, eng
-            except Exception as e:
-                last = e
-        raise last if last else RuntimeError("failed to open dataset")
-
     try:
         import xarray as xr  # noqa
     except Exception as e:
@@ -424,55 +443,49 @@ def merge_parts(
 
     good: List[Tuple[str, str]] = []
     still_bad: List[Tuple[str, str]] = []
-
     for k, p in enumerate(parts, 1):
         try:
-            ds, eng = _open_clean(p)
+            ds, eng = _open_and_normalize(p)
             if debug:
-                log("probe:", _brief_ds_summary(ds, p), f" engine={eng}")
+                log("open:", _brief_ds_summary(ds, p), f" engine={eng}")
             ds.close()
             good.append((p, eng))
             if k % 25 == 0:
                 log(f"probe opened {k}/{len(parts)} parts OK")
         except Exception as e:
             still_bad.append((p, f"{e.__class__.__name__}: {e}"))
-
     for p, emsg in still_bad:
         log(f"warning: {p} unreadable; moved to .bad ({emsg})")
         try:
             shutil.move(p, p + ".bad")
         except Exception:
             pass
-
     if not good:
         return False, []
 
     engines_map = {p: eng for p, eng in good}
     _preflight_report([p for p, _ in good], engines_map, debug=debug)
 
-    # Batch combine to keep memory reasonable
+    # Batch merge via xr.merge (union of variables)
     BATCH = 20
     batch_files = [good[i : i + BATCH] for i in range(0, len(good), BATCH)]
     batch_paths: List[str] = []
-
     import xarray as xr  # ensure available
 
     for bi, items in enumerate(batch_files, 1):
         opened = []
         engines = set()
         for p, eng in items:
-            ds, _ = _open_clean(p)
+            ds, _ = _open_and_normalize(p)
             opened.append(ds)
             engines.add(eng)
         try:
             log(f"merging batch {bi}/{len(batch_files)} with {len(opened)} parts")
-            bds = xr.combine_by_coords(
+            bds = xr.merge(
                 opened,
                 combine_attrs="override",
-                data_vars="minimal",
-                coords="minimal",
                 compat="override",
-                join="override",
+                join="outer",
             )
             if "time" in bds:
                 bds = bds.sortby("time")
@@ -517,14 +530,7 @@ def merge_parts(
             for b in batch_paths
         ]
         log(f"final merge of {len(opened)} batch files")
-        ds = xr.combine_by_coords(
-            opened,
-            combine_attrs="override",
-            data_vars="minimal",
-            coords="minimal",
-            compat="override",
-            join="override",
-        )
+        ds = xr.merge(opened, combine_attrs="override", compat="override", join="outer")
         if "time" in ds:
             ds = ds.sortby("time")
         tmp = outfile + ".tmp"
@@ -638,7 +644,7 @@ def main():
     ap.add_argument(
         "--debug-merge",
         action="store_true",
-        help="Enable verbose xarray debug logs and per-file merge diagnostics.",
+        help="Verbose xarray debug and per-file diagnostics.",
     )
     ap.add_argument(
         "--prune-parts",
@@ -715,7 +721,7 @@ def main():
         print("Saved", args.outfile)
     else:
         log(
-            "xarray not available or parts invalid; kept part files. Install xarray/netCDF4/h5netcdf to auto-merge."
+            "merge failed or skipped; kept part files. Install xarray/netCDF4/h5netcdf and retry."
         )
         print(f"Saved {len(parts)} part files")
 
