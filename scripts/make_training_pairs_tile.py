@@ -697,6 +697,9 @@ def main():
     log.info(f"Loading ERA5-Land:  {args.era5_land}")
     era5_land = xr.open_dataset(args.era5_land)
 
+    print(era5_single.head(20))
+    print(era5_land.head(20))
+
     rows = {k: [] for k in ["t2m", "td2m", "psfc", "tp", "wspd100", "wdir100"]}
 
     files = sorted(glob.glob(os.path.join(OM_DIR, "omifs_*.json")))
@@ -744,6 +747,8 @@ def main():
             continue
 
         log.info(f"[pair] {base}: T={T}, G={G}")
+        print("TIMES: \n", times, "\n")
+        print("GRID: \n", grid, "\n")
 
         t0 = times[0]
         leads = np.array(
@@ -753,6 +758,8 @@ def main():
 
         om_vars = _parse_baseline(j, "om", times, grid, needed)
         ifs_vars = _parse_baseline(j, "ifs", times, grid, needed)
+        
+        print(om_vars, ifs_vars)
 
         missing_keys = [k for k in needed if om_vars.get(k) is None]
         if missing_keys:
