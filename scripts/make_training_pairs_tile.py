@@ -53,15 +53,27 @@ def _get_lat_lon_lists(j):
     """
     Return (lat_list, lon_list) as floats, handling many schemas:
 
-    1) meta.lat / meta.lon : [floats] or [objects]
-    2) meta.lats / meta.lons
-    3) meta.grid.lat / meta.grid.lon
-    4) coords.lat / coords.lon
-    5) om.latitude / om.longitude
-    6) om.meta.lat / om.meta.lon
-    7) om.grid.lat / om.grid.lon
-    8) A single list of points: *.grid.points = [{lat:.., lon:..}, ...] or *.points = [...]
-    9) A flat list of pairs: [[lat, lon], ...] or [{"lat":..,"lon":..}, ...]
+    Accepts all of these (and mixes of them):
+      A) Explicit arrays:
+         - meta.lat / meta.lon
+         - meta.lats / meta.lons
+         - meta.latitude / meta.longitude
+         - meta.grid.lat / meta.grid.lon
+         - coords.lat / coords.lon
+         - om.latitude / om.longitude
+         - om.meta.lat / om.meta.lon
+         - om.grid.lat / om.grid.lon
+         - grid.lat / grid.lon
+      B) Points:
+         - *.grid.points = [{lat:.., lon:..}, ...]
+         - *.points = [...]
+      C) Descriptors (build arrays from a spec):
+         - {values:[...]}
+         - {start:.., stop:.., num:..} or {min:.., max:.., n:..}
+         - {start:.., step:.., count:..} (inclusive of endpoints)
+      D) Bounding box + resolution:
+         - meta.bbox + meta.nx/meta.ny OR meta.n
+         - meta.bbox with keys: north/south/east/west OR lat_min/lat_max/lon_min/lon_max
     """
 
     def dig(root, dotted):
@@ -72,83 +84,214 @@ def _get_lat_lon_lists(j):
             cur = cur[k]
         return cur
 
+    def _as_float(x):
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            return float(x.strip())
+        raise ValueError
+
+    def _ensure_sorted_unique(vals):
+        return [float(v) for v in sorted(set(round(float(v), 7) for v in vals))]
+
+    # ---- descriptor -> sequence ------------------------------------------------
+    def _from_descriptor(desc, axis="lat"):
+        """
+        Turn a dict descriptor into a float list.
+        Supported:
+          - {'values': [...]}
+          - {'start': a, 'stop': b, 'num': N}
+          - {'min': a, 'max': b, 'n': N}
+          - {'start': a, 'step': s, 'count': N}
+        """
+        if not isinstance(desc, dict):
+            return None
+        # direct values
+        if "values" in desc and isinstance(desc["values"], (list, tuple)):
+            out = []
+            for v in desc["values"]:
+                try:
+                    out.append(_as_float(v))
+                except Exception:
+                    continue
+            return out if out else None
+
+        # start/stop/num | min/max/n
+        keys1 = [("start", "stop", "num"), ("min", "max", "n")]
+        for a, b, n in keys1:
+            if a in desc and b in desc and n in desc:
+                try:
+                    a_v, b_v = _as_float(desc[a]), _as_float(desc[b])
+                    n_v = int(desc[n])
+                    if n_v <= 0:
+                        return None
+                    return list(np.linspace(a_v, b_v, n_v))
+                except Exception:
+                    pass
+
+        # start/step/count
+        if all(k in desc for k in ("start", "step", "count")):
+            try:
+                start = _as_float(desc["start"])
+                step = _as_float(desc["step"])
+                cnt = int(desc["count"])
+                if cnt <= 0:
+                    return None
+                return [start + i * step for i in range(cnt)]
+            except Exception:
+                pass
+
+        # sometimes nested: {'array': [...]} or {'data': [...]}
+        for k in ("array", "data"):
+            if k in desc and isinstance(desc[k], (list, tuple)):
+                try:
+                    return [_as_float(v) for v in desc[k]]
+                except Exception:
+                    pass
+
+        return None
+
+    # ---- bbox + resolution -----------------------------------------------------
+    def _from_bbox(meta):
+        """
+        Build lat/lon lists from a bbox + nx/ny (or 'n' square).
+        bbox may be:
+          - dict with north/south/east/west
+          - dict with lat_min/lat_max/lon_min/lon_max
+          - list/tuple [lat_min, lat_max, lon_min, lon_max] (Open-Meteo-ish)
+        Resolution:
+          - nx/ny or n
+        """
+        if not isinstance(meta, dict):
+            return None, None
+
+        bbox = meta.get("bbox")
+        if bbox is None:
+            return None, None
+
+        def _parse_bbox(bb):
+            if isinstance(bb, dict):
+                # named keys
+                if all(k in bb for k in ("south", "north", "west", "east")):
+                    return (
+                        _as_float(bb["south"]),
+                        _as_float(bb["north"]),
+                        _as_float(bb["west"]),
+                        _as_float(bb["east"]),
+                    )
+                if all(k in bb for k in ("lat_min", "lat_max", "lon_min", "lon_max")):
+                    return (
+                        _as_float(bb["lat_min"]),
+                        _as_float(bb["lat_max"]),
+                        _as_float(bb["lon_min"]),
+                        _as_float(bb["lon_max"]),
+                    )
+            elif isinstance(bb, (list, tuple)) and len(bb) == 4:
+                # assume [lat_min, lat_max, lon_min, lon_max]
+                return (
+                    _as_float(bb[0]),
+                    _as_float(bb[1]),
+                    _as_float(bb[2]),
+                    _as_float(bb[3]),
+                )
+            return None
+
+        parsed = _parse_bbox(bbox)
+        if not parsed:
+            return None, None
+        lat_min, lat_max, lon_min, lon_max = parsed
+
+        nx = meta.get("nx")
+        ny = meta.get("ny")
+        n = meta.get("n")
+        try:
+            if nx is None and ny is None and n is not None:
+                nx = ny = int(n)
+            if nx is None or ny is None:
+                # also allow 'res' or 'resolution' as approximate count per axis
+                res = meta.get("res") or meta.get("resolution")
+                if res is not None:
+                    nx = ny = int(res)
+            nx = int(nx) if nx is not None else None
+            ny = int(ny) if ny is not None else None
+        except Exception:
+            nx = ny = None
+
+        if not nx or not ny:
+            return None, None
+
+        # Build inclusive ranges
+        lat_list = list(np.linspace(lat_min, lat_max, ny))
+        lon_list = list(np.linspace(lon_min, lon_max, nx))
+        return lat_list, lon_list
+
+    # ---- heterogeneous list -> floats -----------------------------------------
     def _to_float_seq(seq, key_candidates=("lat", "latitude", "y", "value")):
-        """Coerce a heterogeneous list into a list[float]. Accept numbers, strings,
-        dicts with key_candidates, or 1-2 element lists/tuples."""
         out = []
         for x in seq:
-            if isinstance(x, (int, float)):
-                out.append(float(x))
+            try:
+                out.append(_as_float(x))
                 continue
-            if isinstance(x, str):
-                try:
-                    out.append(float(x))
-                    continue
-                except:
-                    pass
+            except Exception:
+                pass
+            # descriptors embedded in the list
             if isinstance(x, dict):
+                vals = _from_descriptor(x)
+                if vals:
+                    out.extend(vals)
+                    continue
                 got = None
                 for kk in key_candidates:
                     if kk in x:
-                        vv = x[kk]
-                        if isinstance(vv, (int, float)):
-                            got = float(vv)
+                        try:
+                            got = _as_float(x[kk])
                             break
-                        if isinstance(vv, str):
-                            try:
-                                got = float(vv)
-                                break
-                            except:
-                                pass
+                        except Exception:
+                            pass
                 if got is not None:
                     out.append(got)
                     continue
             if isinstance(x, (list, tuple)) and len(x) >= 1:
-                v = x[0]
-                if isinstance(v, (int, float)):
-                    out.append(float(v))
+                try:
+                    out.append(_as_float(x[0]))
                     continue
-                if isinstance(v, str):
-                    try:
-                        out.append(float(v))
-                        continue
-                    except:
-                        pass
+                except Exception:
+                    pass
         return out if out else None
 
     def _from_points(seq):
-        """seq like [{'lat':..,'lon':..}, ...] or [[lat, lon], ...] -> unique sorted lat[], lon[]."""
         lats, lons = [], []
         for p in seq:
             la = lo = None
             if isinstance(p, dict):
                 for k in ("lat", "latitude", "y"):
                     if k in p:
-                        v = p[k]
-                        la = float(v) if isinstance(v, (int, float)) else float(str(v))
-                        break
+                        try:
+                            la = _as_float(p[k])
+                            break
+                        except Exception:
+                            pass
                 for k in ("lon", "longitude", "x"):
                     if k in p:
-                        v = p[k]
-                        lo = float(v) if isinstance(v, (int, float)) else float(str(v))
-                        break
+                        try:
+                            lo = _as_float(p[k])
+                            break
+                        except Exception:
+                            pass
             elif isinstance(p, (list, tuple)) and len(p) >= 2:
                 try:
-                    la = float(p[0])
-                    lo = float(p[1])
-                except:
+                    la = _as_float(p[0])
+                    lo = _as_float(p[1])
+                except Exception:
                     pass
             if la is not None and lo is not None:
                 lats.append(la)
                 lons.append(lo)
         if lats and lons:
-            # dedupe while preserving order-ish
-            lat_u = sorted(set(round(v, 6) for v in lats))
-            lon_u = sorted(set(round(v, 6) for v in lons))
-            return [float(v) for v in lat_u], [float(v) for v in lon_u]
+            return _ensure_sorted_unique(lats), _ensure_sorted_unique(lons)
         return None, None
 
-    # Candidate pairs of arrays (lat[], lon[])
+    # 1) Try explicit array pairs first (and allow descriptors at those paths)
     array_pairs = [
         ("meta.lat", "meta.lon"),
         ("meta.lats", "meta.lons"),
@@ -158,29 +301,37 @@ def _get_lat_lon_lists(j):
         ("om.latitude", "om.longitude"),
         ("om.meta.lat", "om.meta.lon"),
         ("om.grid.lat", "om.grid.lon"),
+        ("grid.lat", "grid.lon"),
     ]
     for p_lat, p_lon in array_pairs:
         lat_raw, lon_raw = dig(j, p_lat), dig(j, p_lon)
-        if (
-            lat_raw is not None
-            and lon_raw is not None
-            and isinstance(lat_raw, (list, tuple))
-            and isinstance(lon_raw, (list, tuple))
-        ):
+        if lat_raw is None or lon_raw is None:
+            continue
+
+        # if dict descriptors
+        if isinstance(lat_raw, dict):
+            lat = _from_descriptor(lat_raw, axis="lat")
+        else:
             lat = _to_float_seq(lat_raw)
+
+        if isinstance(lon_raw, dict):
+            lon = _from_descriptor(lon_raw, axis="lon")
+        else:
             lon = _to_float_seq(
                 lon_raw, key_candidates=("lon", "longitude", "x", "value")
             )
-            if lat and lon:
-                return lat, lon
 
-    # Points-style schemas
+        if lat and lon:
+            return lat, lon
+
+    # 2) Points-style schemas
     point_candidates = [
         "meta.grid.points",
         "meta.points",
         "om.grid.points",
         "om.points",
         "coords.points",
+        "grid.points",
     ]
     for path in point_candidates:
         seq = dig(j, path)
@@ -189,17 +340,39 @@ def _get_lat_lon_lists(j):
             if lat and lon:
                 return lat, lon
 
-    # Sometimes everything is under a top-level 'grid'
+    # 3) Descriptor-only lat/lon at common locations (e.g., meta.lat is a descriptor)
+    for p_lat, p_lon in array_pairs:
+        lat_raw, lon_raw = dig(j, p_lat), dig(j, p_lon)
+        if isinstance(lat_raw, dict) and isinstance(lon_raw, dict):
+            lat = _from_descriptor(lat_raw, axis="lat")
+            lon = _from_descriptor(lon_raw, axis="lon")
+            if lat and lon:
+                return lat, lon
+
+    # 4) BBox + resolution on meta or top-level
+    for node in (j.get("meta", {}), j):
+        lat, lon = _from_bbox(node)
+        if lat and lon:
+            return lat, lon
+
+    # 5) Some dumps put everything under a single 'grid' dict with descriptors
     grid = j.get("grid")
     if isinstance(grid, dict):
         lat_raw, lon_raw = grid.get("lat"), grid.get("lon")
-        if isinstance(lat_raw, (list, tuple)) and isinstance(lon_raw, (list, tuple)):
-            lat = _to_float_seq(lat_raw)
-            lon = _to_float_seq(
+        lat = (
+            _from_descriptor(lat_raw, axis="lat")
+            if isinstance(lat_raw, dict)
+            else _to_float_seq(lat_raw)
+        )
+        lon = (
+            _from_descriptor(lon_raw, axis="lon")
+            if isinstance(lon_raw, dict)
+            else _to_float_seq(
                 lon_raw, key_candidates=("lon", "longitude", "x", "value")
             )
-            if lat and lon:
-                return lat, lon
+        )
+        if lat and lon:
+            return lat, lon
         pts = grid.get("points")
         if isinstance(pts, (list, tuple)):
             lat, lon = _from_points(pts)

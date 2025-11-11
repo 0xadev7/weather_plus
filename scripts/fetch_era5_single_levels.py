@@ -423,7 +423,7 @@ def main():
     merged, used_parts = merge_parts(part_paths, args.outfile, debug=args.debug_merge)
     if merged:
         log(f"Merged -> {args.outfile}")
-        if args.prune - parts:
+        if args.prune_parts:
             _prune_after_merge(used_parts)
     else:
         log(
