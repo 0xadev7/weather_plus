@@ -58,6 +58,34 @@ def as_tg(arr, T, G):
 
 
 # -------------------------
+# Manifest (processed OM files per tile)
+# -------------------------
+def _manifest_path(tile_id: str) -> str:
+    return os.path.join(OUT_DIR, f"{tile_id}__processed_om.txt")
+
+
+def _load_processed(tile_id: str) -> set[str]:
+    path = _manifest_path(tile_id)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r") as f:
+            return {line.strip() for line in f if line.strip()}
+    except Exception:
+        return set()
+
+
+def _append_processed(tile_id: str, basenames: list[str]) -> None:
+    if not basenames:
+        return
+    path = _manifest_path(tile_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        for b in basenames:
+            f.write(b + "\n")
+
+
+# -------------------------
 # Robust lat/lon parsing
 # -------------------------
 def _get_lat_lon_lists(j):
@@ -590,42 +618,61 @@ def nearest_truth(ds, key, grid, times):
 
 
 # -------------------------
-# Robust parquet writer (pyarrow -> fastparquet -> CSV fallback)
+# Robust parquet writer (with append+dedupe)
 # -------------------------
-def safe_to_parquet(df: pd.DataFrame, path: str):
+def safe_to_parquet(
+    df: pd.DataFrame, path: str, append: bool = False, subset=("lat", "lon", "time")
+):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    engines = []
-    # Try pyarrow first (fast + best interoperability)
-    try:
-        import pyarrow  # noqa: F401
 
-        engines.append(("pyarrow", {}))
-    except Exception:
-        pass
-    # Fallback to fastparquet if available
-    try:
-        import fastparquet  # noqa: F401
-
-        engines.append(("fastparquet", {}))
-    except Exception:
-        pass
-
-    last_err = None
-    for eng, kwargs in engines:
+    def _write(df_final: pd.DataFrame):
+        engines = []
         try:
-            log.debug(f"[parquet] writing {path} using engine={eng}")
-            df.to_parquet(path, engine=eng, index=False, **kwargs)
+            import pyarrow  # noqa: F401
+
+            engines.append(("pyarrow", {}))
+        except Exception:
+            pass
+        try:
+            import fastparquet  # noqa: F401
+
+            engines.append(("fastparquet", {}))
+        except Exception:
+            pass
+
+        last_err = None
+        for eng, kwargs in engines:
+            try:
+                log.debug(f"[parquet] writing {path} using engine={eng}")
+                df_final.to_parquet(path, engine=eng, index=False, **kwargs)
+                return
+            except Exception as e:
+                log.warning(f"[parquet] engine={eng} failed: {e!r}")
+                last_err = e
+
+        # Final fallback: CSV
+        csv_path = os.path.splitext(path)[0] + ".csv"
+        df_final.to_csv(csv_path, index=False)
+        log.error(
+            f"[parquet] all parquet engines failed; wrote CSV fallback: {csv_path}"
+        )
+        if last_err:
+            log.debug(f"[parquet] last error: {last_err!r}")
+
+    if append and os.path.exists(path):
+        try:
+            prev = pd.read_parquet(path)
+            combined = pd.concat([prev, df], ignore_index=True)
+            if subset:
+                combined = combined.drop_duplicates(subset=list(subset), keep="last")
+            _write(combined)
             return
         except Exception as e:
-            log.warning(f"[parquet] engine={eng} failed: {e!r}")
-            last_err = e
-
-    # Final fallback: CSV (so pipeline doesn’t hard-fail)
-    csv_path = os.path.splitext(path)[0] + ".csv"
-    df.to_csv(csv_path, index=False)
-    log.error(f"[parquet] all parquet engines failed; wrote CSV fallback: {csv_path}")
-    if last_err:
-        log.debug(f"[parquet] last error: {last_err!r}")
+            log.warning(
+                f"[parquet] append failed to read existing {path}: {e!r}; rewriting fresh"
+            )
+            # Fall through to fresh write
+    _write(df)
 
 
 # -------------------------
@@ -637,6 +684,11 @@ def main():
     ap.add_argument("--era5-land", required=True)
     ap.add_argument("--tile-id", required=True)
     ap.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore manifest and rebuild from all OM JSONs",
+    )
     args = ap.parse_args()
     setup_logging(args.log_level)
 
@@ -651,6 +703,9 @@ def main():
     if not files:
         raise SystemExit("No OM baseline files found")
 
+    processed = set() if args.force else _load_processed(args.tile_id)
+    new_processed: list[str] = []
+
     needed = [
         "temperature_2m",
         "dew_point_2m",
@@ -661,31 +716,34 @@ def main():
     ]
 
     for p in files:
+        base = os.path.basename(p)
+        if base in processed:
+            log.info(f"[pair] skip already processed: {base}")
+            continue
+
         try:
             with open(p, "r") as f:
                 j = json.load(f)
         except Exception as e:
-            log.warning(f"[pair] skip {os.path.basename(p)} (invalid JSON: {e})")
+            log.warning(f"[pair] skip {base} (invalid JSON: {e})")
             continue
 
         grid = _extract_grid_points(j)
         if not grid:
-            log.warning(
-                f"[pair] skip {os.path.basename(p)} (unable to parse lat/lon grid)"
-            )
+            log.warning(f"[pair] skip {base} (unable to parse lat/lon grid)")
             continue
 
         times = _extract_times(j)
         if not times:
-            log.warning(f"[pair] skip {os.path.basename(p)} (unable to parse times)")
+            log.warning(f"[pair] skip {base} (unable to parse times)")
             continue
 
         T, G = len(times), len(grid)
         if T == 0 or G == 0:
-            log.warning(f"[pair] skip {os.path.basename(p)} (empty times or grid)")
+            log.warning(f"[pair] skip {base} (empty times or grid)")
             continue
 
-        log.info(f"[pair] {os.path.basename(p)}: T={T}, G={G}")
+        log.info(f"[pair] {base}: T={T}, G={G}")
 
         t0 = times[0]
         leads = np.array(
@@ -698,9 +756,7 @@ def main():
 
         missing_keys = [k for k in needed if om_vars.get(k) is None]
         if missing_keys:
-            log.warning(
-                f"[pair] skip {os.path.basename(p)} (missing OM keys: {missing_keys})"
-            )
+            log.warning(f"[pair] skip {base} (missing OM keys: {missing_keys})")
             continue
 
         b_t2m_om = om_vars["temperature_2m"]
@@ -747,7 +803,7 @@ def main():
             if b_wdir_ifs is not None:
                 b_wdir_ifs = _ensure_TG(b_wdir_ifs)
         except Exception as e:
-            log.warning(f"[pair] skip {os.path.basename(p)} (shape issue: {e})")
+            log.warning(f"[pair] skip {base} (shape issue: {e})")
             continue
 
         try:
@@ -755,9 +811,7 @@ def main():
             ds_d2m = _prefer_dataset_for(era5_land, era5_single, "d2m")
             ds_tp = _prefer_dataset_for(era5_land, era5_single, "tp")
             ds_sp = _prefer_dataset_for(era5_land, era5_single, "sp")
-            ds_u100 = _prefer_dataset_for(
-                era5_land, era5_single, "u100"
-            )  # typically single
+            ds_u100 = _prefer_dataset_for(era5_land, era5_single, "u100")  # single
             ds_v100 = _prefer_dataset_for(era5_land, era5_single, "v100")
 
             t2m_truth = to_celsius(nearest_truth(ds_t2m, "t2m", grid, times))
@@ -769,7 +823,7 @@ def main():
             wspd_truth = ms_to_kmh(np.hypot(u100, v100))
             wdir_truth = (np.degrees(np.arctan2(-u100, -v100)) + 360.0) % 360.0
         except Exception as e:
-            log.warning(f"[pair] skip {os.path.basename(p)} (ERA5 sample error: {e})")
+            log.warning(f"[pair] skip {base} (ERA5 sample error: {e})")
             continue
 
         def emit(rows_list, bom, bifs, truth):
@@ -803,9 +857,11 @@ def main():
         emit(rows["wspd100"], b_wspd_om, b_wspd_ifs, wspd_truth)
         emit(rows["wdir100"], b_wdir_om, b_wdir_ifs, wdir_truth)
 
-        log.info(f"paired {os.path.basename(p)} → {args.tile_id}")
+        log.info(f"paired {base} → {args.tile_id}")
+        new_processed.append(base)
 
-    # Write per-tile outputs
+    # Write per-tile outputs (append + dedupe by lat,lon,time)
+    uniq_key = ("lat", "lon", "time")
     for key, outname in [
         ("t2m", "t2m"),
         ("td2m", "td2m"),
@@ -817,12 +873,20 @@ def main():
         df = pd.DataFrame(rows[key])
         out_path = os.path.join(OUT_DIR, f"{args.tile_id}__{outname}.parquet")
         if not df.empty:
-            safe_to_parquet(df, out_path)
-            log.info(f"saved {args.tile_id} {outname} -> {out_path}")
+            # append into existing, drop duplicates
+            safe_to_parquet(df, out_path, append=True, subset=uniq_key)
+            log.info(f"saved {args.tile_id} {outname} -> {out_path} (append+dedupe)")
         else:
-            log.warning(
-                f"[pair] empty dataframe for {outname} on {args.tile_id} (no matching OM files / coords?)"
-            )
+            log.info(f"[pair] no new rows for {outname} on {args.tile_id}")
+
+    # Update manifest last, only if we actually wrote rows from those files
+    _append_processed(args.tile_id, new_processed)
+    if new_processed:
+        log.info(
+            f"[manifest] recorded {len(new_processed)} new OM files for {args.tile_id}"
+        )
+    else:
+        log.info(f"[manifest] no new OM files processed for {args.tile_id}")
 
 
 if __name__ == "__main__":
