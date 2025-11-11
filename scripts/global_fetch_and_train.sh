@@ -24,7 +24,7 @@ export HDF5_USE_FILE_LOCKING=FALSE
 # -----------------------------
 # Config (env overridable)
 # -----------------------------
-START="${START:-2025-10-01T00:00}"
+START="${START:-2025-10-25T00:00}"
 END="${END:-2025-11-01T00:00}"
 
 LAT_STEPS="${LAT_STEPS:-7}"
