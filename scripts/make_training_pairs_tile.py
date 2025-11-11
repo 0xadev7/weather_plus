@@ -880,6 +880,13 @@ def main():
             ds_sp = _prefer_dataset_for(era5_land, era5_single, "sp")
             ds_u100 = _prefer_dataset_for(era5_land, era5_single, "u100")
             ds_v100 = _prefer_dataset_for(era5_land, era5_single, "v100")
+            
+            with pd.option_context('display.max_rows', None,
+                       'display.max_columns', None,
+                       'display.width', None,
+                       'display.max_colwidth', None):
+                print(ds_t2m.head(1000))
+                print(ds_d2m.head(1000))
 
             t2m_truth = to_celsius(nearest_truth(ds_t2m, "t2m", grid, times))
             td2m_truth = to_celsius(nearest_truth(ds_d2m, "d2m", grid, times))
