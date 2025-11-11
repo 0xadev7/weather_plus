@@ -65,7 +65,7 @@ VAR_ALIASES_LONG_TO_SHORT = {v: k for k, v in VAR_ALIASES_SHORT_TO_LONG.items()}
 
 HOURS_ALL = [f"{h:02d}:00" for h in range(24)]
 
-NETCDF_MAGIC = (b"CDF",)  # classic/64-bit offset start with 'CDF'
+NETCDF3_MAGIC = (b"CDF",)  # classic & 64-bit offset start with 'CDF'
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 ZIP_MAGIC = b"PK\x03\x04"
 
@@ -79,7 +79,7 @@ def _is_netcdf_or_hdf5_or_zip(path: str) -> bool:
             head = f.read(8)
         return (
             head.startswith(HDF5_MAGIC)
-            or head.startswith(NETCDF_MAGIC)
+            or head.startswith(NETCDF3_MAGIC)
             or head.startswith(ZIP_MAGIC)
         )
     except Exception:
@@ -87,7 +87,7 @@ def _is_netcdf_or_hdf5_or_zip(path: str) -> bool:
 
 
 def _weed_bad_parts(parts: List[str]) -> Tuple[List[str], List[str]]:
-    """Filter out zero-byte or non NetCDF/HDF5 files. ZIPs should have been expanded earlier."""
+    """Keep only files that look like NetCDF3/4(HDF5)."""
     good, bad = [], []
     for p in parts:
         try:
@@ -96,7 +96,7 @@ def _weed_bad_parts(parts: List[str]) -> Tuple[List[str], List[str]]:
                 continue
             with open(p, "rb") as f:
                 head = f.read(8)
-            if head.startswith(HDF5_MAGIC) or head.startswith(NETCDF_MAGIC):
+            if head.startswith(HDF5_MAGIC) or head.startswith(NETCDF3_MAGIC):
                 good.append(p)
             else:
                 bad.append(p)
@@ -474,13 +474,7 @@ def main():
 
     # Minimal logger for xarray internals if requested
     if args.debug_merge:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
         logging.getLogger("xarray").setLevel(logging.DEBUG)
-        logging.getLogger("netCDF4").setLevel(logging.INFO)
-        logging.getLogger("h5netcdf").setLevel(logging.INFO)
 
     os.makedirs(os.path.dirname(args.outfile) or ".", exist_ok=True)
     c = cdsapi.Client()  # requires valid ~/.cdsapirc
@@ -710,23 +704,46 @@ def merge_parts(
     def _open_clean(path: str):
         import xarray as xr
 
-        last = None
-        for eng in ("netcdf4", "h5netcdf", "scipy"):
+        # Peek magic bytes to choose engines deterministically
+        with open(path, "rb") as f:
+            head = f.read(8)
+        is_hdf5 = head.startswith(HDF5_MAGIC)
+        is_nc3 = head.startswith(NETCDF3_MAGIC)
+
+        # Preferred engine order by file type
+        if is_hdf5:
+            engine_try = ("h5netcdf", "netcdf4")  # both read NetCDF-4/HDF5
+        elif is_nc3:
+            engine_try = ("netcdf4", "scipy")  # NetCDF4 python can read classic too
+        else:
+            # last resort: try everything
+            engine_try = ("h5netcdf", "netcdf4", "scipy")
+
+        last_err = None
+        for eng in engine_try:
             try:
+                # Backend-specific kwargs that improve robustness
+                backend_kwargs = {}
+                if eng == "h5netcdf":
+                    # phony_dims='sort' handles files without dimension scales cleanly
+                    backend_kwargs = {"phony_dims": "sort"}
                 ds = xr.open_dataset(
                     path,
                     engine=eng,
                     decode_times=True,
-                    chunks={},  # avoid dask auto-chunk across many files
                     mask_and_scale=True,
-                    use_cftime=None,  # let xarray auto-choose
+                    use_cftime=None,
+                    chunks={},  # avoid auto-chunking large graphs
                     cache=False,
+                    backend_kwargs=backend_kwargs or None,
                 )
                 ds = _normalize_dataset(ds)
                 return ds, eng
             except Exception as e:
-                last = e
-        raise last if last else RuntimeError("failed to open dataset")
+                last_err = e
+                continue
+        # Propagate the most informative error
+        raise last_err if last_err else RuntimeError("failed to open dataset")
 
     # Pre-open all, isolating bad files quickly and logging progress
     good: List[Tuple[str, str]] = []  # (path, engine)

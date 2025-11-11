@@ -21,7 +21,10 @@ dependencies = [
   "pyproj>=3.6",
   "xESMF>=0.8.5",
   "cdsapi>=0.7.7",
-  "fastparquet"
+  "netCDF4",
+  "fastparquet",
+  "h5netcdf",
+  "cftime"
 ]
 
 [tool.setuptools.package-dir]

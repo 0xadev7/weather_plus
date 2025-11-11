@@ -12,3 +12,6 @@ __pycache__/
 models/**/*
 data/**/*
 tiles/**/*
+
+.venv
+*.egg-info

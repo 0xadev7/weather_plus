@@ -654,13 +654,7 @@ def main():
     args = ap.parse_args()
 
     if args.debug_merge:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
         logging.getLogger("xarray").setLevel(logging.DEBUG)
-        logging.getLogger("netCDF4").setLevel(logging.INFO)
-        logging.getLogger("h5netcdf").setLevel(logging.INFO)
 
     os.makedirs(os.path.dirname(args.outfile) or ".", exist_ok=True)
     c = cdsapi.Client()
