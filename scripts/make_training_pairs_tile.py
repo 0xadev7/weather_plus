@@ -415,21 +415,6 @@ def main():
             print(f"[pair] skip {os.path.basename(p)} (invalid JSON: {e})")
             continue
 
-        # Pull grid
-        lat, lon = None, None
-        meta = j.get("meta", {})
-        # First try declared helper
-        lat, lon = _get_lat_lon_lists(j)
-        if lat is None or lon is None:
-            print(f"[pair] skip {os.path.basename(p)} (unable to parse lat/lon grid)")
-            continue
-
-        if lat is None or lon is None:
-            print(
-                f"[pair] skip {os.path.basename(p)} (no lat/lon grid in meta/om/coords)"
-            )
-            continue
-
         # Pull hourly block(s)
         om = _safe_get(j, "om", "hourly", default=None)
         ifs = _safe_get(j, "ifs", "hourly", default=None)
