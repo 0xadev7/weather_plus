@@ -407,10 +407,19 @@ def _extract_times(j):
     return None
 
 
+def _lon_canon(l):
+    # Canonicalize to [-180, 180), mapping +180 -> -180
+    x = ((float(l) + 180.0) % 360.0) - 180.0
+    return -180.0 if abs(x - 180.0) < 1e-9 else x
+
+
 def _lon_diff_deg(a, b):
-    """Shortest signed lon difference in degrees (wrapping at 180)."""
-    d = (a - b + 540.0) % 360.0 - 180.0
-    return d
+    """Shortest signed lon difference in degrees with ±180 equivalence."""
+    A = _lon_canon(a)
+    B = _lon_canon(b)
+    d = ((A - B + 540.0) % 360.0) - 180.0
+    # Make 180 act like -180 to avoid edge mismatches
+    return -180.0 if abs(d - 180.0) < 1e-9 else d
 
 
 def _nearest_idx_points(points_lat, points_lon, req_lat, req_lon):
@@ -426,15 +435,16 @@ def _nearest_idx_points(points_lat, points_lon, req_lat, req_lon):
     return int(np.argmin(dist2)), float(np.min(dist2))
 
 
-def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.45):
+def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.6):
     """
     Build (T,G) array on requested grid by snapping each requested (lat,lon)
     to the nearest available returned point (lat',lon') within tol_deg.
+    Adds a polar rule: when |lat| >= 89.5°, ignore longitude in distance.
     """
     T, G = len(times), len(grid)
 
     # Collect available coordinates and series
-    pts_lat, pts_lon, series_per_point, times_per_point = [], [], [], []
+    pts_lat, pts_lon, series = [], [], []
     for p in point_list:
         la = p.get("latitude")
         lo = p.get("longitude")
@@ -442,9 +452,11 @@ def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.45):
         vals = hb.get(name)
         if la is None or lo is None or vals is None:
             continue
+
         v = np.asarray(vals, dtype=float)
         p_times = _parse_times_from_hourly_block(hb)
-        # Time-align if needed
+
+        # Align time length to requested axis if needed
         if p_times and len(p_times) == v.size and v.size != T:
             aligned = np.empty(T, dtype=float)
             for i, tt in enumerate(times):
@@ -452,31 +464,44 @@ def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.45):
                 aligned[i] = float(v[j])
             v = aligned
         elif v.size != T:
-            # If sizes mismatch and no usable time list, skip this point
+            # Can't align → skip this point
             continue
 
         pts_lat.append(float(la))
-        pts_lon.append(float(lo))
-        series_per_point.append(v.astype(float))
-        times_per_point.append(True)  # marker
+        pts_lon.append(_lon_canon(lo))
+        series.append(v.astype(float))
 
-    if not series_per_point:
+    if not series:
         raise KeyError(f"no points carried var {name}")
 
-    # Build out matrix by nearest-neighbour snap per requested grid point
-    out = np.empty((T, G), dtype=float)
-    out[:] = np.nan
-    # absolute tolerance in degrees ~0.45 (~50 km at mid-lats for IFS/GFS grids)
+    pts_lat = np.asarray(pts_lat)
+    pts_lon = np.asarray(pts_lon)
+    out = np.full((T, G), np.nan, dtype=float)
     tol2 = tol_deg**2
 
     for gi, (la_req, lo_req) in enumerate(grid):
-        idx, d2 = _nearest_idx_points(pts_lat, pts_lon, la_req, lo_req)
-        if d2 > tol2:
-            # leave as NaN; will be handled by caller
-            continue
-        out[:, gi] = series_per_point[idx]
+        la_req = float(la_req)
+        lo_req = _lon_canon(lo_req)
 
-    # If everything missing, signal to caller
+        # Polar snap: ignore longitude when near the poles
+        if abs(la_req) >= 89.5:
+            dlat = np.abs(pts_lat - la_req)
+            idx = int(np.argmin(dlat))
+            d2 = float(dlat[idx] ** 2)  # only latitude contributes
+        else:
+            dlat = pts_lat - la_req
+            dlon = np.array([_lon_diff_deg(L, lo_req) for L in pts_lon], dtype=float)
+            w = np.cos(
+                np.deg2rad(la_req)
+            )  # shrink longitudinal distance away from equator
+            dist2 = dlat * dlat + (w * dlon) * (w * dlon)
+            idx = int(np.argmin(dist2))
+            d2 = float(dist2[idx])
+
+        if d2 <= tol2:
+            out[:, gi] = series[idx]
+        # else: leave NaN; caller will handle (and we’ll log in the shape check)
+    # If absolutely nothing matched, signal failure
     if np.all(~np.isfinite(out)):
         raise KeyError(f"no points matched requested grid for var {name}")
     return out
