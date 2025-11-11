@@ -2,13 +2,15 @@
 """
 Robust ERA5 single-levels fetcher with chunking, retries, merging, and ZIP handling.
 
-Variables:
+Variables requested (long names):
 - 10m_u_component_of_wind, 10m_v_component_of_wind
 - 100m_u_component_of_wind, 100m_v_component_of_wind
 - surface_pressure, total_precipitation
 - 2m_temperature, 2m_dewpoint_temperature
 
 Key fixes in this version:
+- Handles ERA5 short var names (u10, v10, u100, v100, sp, tp, t2m, d2m) by aliasing/renaming to long names
+- Normalizes coords: valid_time→time, drops singleton 'number', resolves 'expver'
 - ZIP extraction uses unique, collision-proof filenames based on the part tag
 - Month/day lists respect actual calendar days within [a,b)
 - Clearer merge logging with --debug-merge (per-file summaries + xarray internal logs)
@@ -36,6 +38,7 @@ import cdsapi
 # Helpers
 # ---------------------------
 
+# Long names you request from CDS
 VARS = [
     "10m_u_component_of_wind",
     "10m_v_component_of_wind",
@@ -46,6 +49,19 @@ VARS = [
     "2m_temperature",
     "2m_dewpoint_temperature",
 ]
+
+# ERA5 returns these short names inside the .nc
+VAR_ALIASES_SHORT_TO_LONG = {
+    "u10": "10m_u_component_of_wind",
+    "v10": "10m_v_component_of_wind",
+    "u100": "100m_u_component_of_wind",
+    "v100": "100m_v_component_of_wind",
+    "sp": "surface_pressure",
+    "tp": "total_precipitation",
+    "t2m": "2m_temperature",
+    "d2m": "2m_dewpoint_temperature",
+}
+VAR_ALIASES_LONG_TO_SHORT = {v: k for k, v in VAR_ALIASES_SHORT_TO_LONG.items()}
 
 HOURS_ALL = [f"{h:02d}:00" for h in range(24)]
 
@@ -238,14 +254,14 @@ def build_request(a: dt.datetime, b: dt.datetime, args) -> dict:
     months, days = _build_month_day_lists(a, b)
     return {
         "product_type": "reanalysis",
-        "variable": VARS,
+        "variable": VARS,  # request using long names
         "year": years,
         "month": months,
         "day": days,
         "time": hours,
         "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],  # N, W, S, E
         "format": "netcdf",
-        "expver": ["1", "5"],  # may trigger ZIP response with multiple streams
+        "expver": ["1", "5"],  # CDS may return multi-stream ZIP
     }
 
 
@@ -324,6 +340,105 @@ def _maybe_unzip_to_nc(path: str) -> List[str]:
 
 
 # ---------------------------
+# Normalization helpers
+# ---------------------------
+
+
+def _resolve_expver(ds):
+    """Prefer expver=1, then 5, else first."""
+    if "expver" in ds.dims or "expver" in ds.coords:
+        try:
+            expvers = ds["expver"].values.tolist()
+        except Exception:
+            expvers = None
+        target = None
+        if expvers is not None:
+            if 1 in expvers:
+                target = 1
+            elif 5 in expvers:
+                target = 5
+        if target is None:
+            # fallback to the first index
+            return ds.isel(expver=0) if "expver" in ds.dims else ds
+        try:
+            # expver may be numeric or string; try both
+            idx = list(expvers).index(target)
+            return ds.isel(expver=idx)
+        except Exception:
+            try:
+                return ds.sel(expver=target)
+            except Exception:
+                return ds.isel(expver=0)
+    return ds
+
+
+def _drop_singleton_number(ds):
+    if "number" in ds.dims and ds.sizes.get("number", 1) == 1:
+        try:
+            ds = ds.isel(number=0)
+        except Exception:
+            pass
+    return ds
+
+
+def _rename_valid_time(ds):
+    if "valid_time" in ds.coords or "valid_time" in ds.dims:
+        try:
+            ds = ds.rename({"valid_time": "time"})
+        except Exception:
+            pass
+    return ds
+
+
+def _standardize_latlon(ds):
+    # Ensure coords named 'latitude'/'longitude'
+    rename = {}
+    if "lat" in ds.coords and "latitude" not in ds.coords:
+        rename["lat"] = "latitude"
+    if "lon" in ds.coords and "longitude" not in ds.coords:
+        rename["lon"] = "longitude"
+    if rename:
+        try:
+            ds = ds.rename(rename)
+        except Exception:
+            pass
+    return ds
+
+
+def _rename_vars_to_long_names(ds):
+    """Rename ERA5 short var names to the requested long names so checks/merge align."""
+    mapping = {
+        short: long
+        for short, long in VAR_ALIASES_SHORT_TO_LONG.items()
+        if short in ds.data_vars
+    }
+    if mapping:
+        ds = ds.rename(mapping)
+    return ds
+
+
+def _normalize_dataset(ds):
+    ds = _rename_valid_time(ds)
+    ds = _resolve_expver(ds)
+    ds = _drop_singleton_number(ds)
+    ds = _standardize_latlon(ds)
+    ds = _rename_vars_to_long_names(ds)
+    # Sort time and drop duplicate time stamps
+    if "time" in ds:
+        try:
+            ds = ds.sortby("time")
+            import numpy as np
+
+            vals = ds["time"].values
+            _, idx = np.unique(vals, return_index=True)
+            if len(idx) != ds.sizes.get("time", len(idx)):
+                ds = ds.isel(time=sorted(idx))
+        except Exception:
+            pass
+    return ds
+
+
+# ---------------------------
 # Main
 # ---------------------------
 
@@ -364,7 +479,6 @@ def main():
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
         logging.getLogger("xarray").setLevel(logging.DEBUG)
-        # netCDF or h5netcdf can be noisy; leave at INFO unless you need more:
         logging.getLogger("netCDF4").setLevel(logging.INFO)
         logging.getLogger("h5netcdf").setLevel(logging.INFO)
 
@@ -497,7 +611,7 @@ def _preflight_report(paths: List[str], engines: Dict[str, str], debug: bool):
         return
 
     all_vars: Set[str] = set()
-    per_file_vars: Dict[str, Set[str]] = {}
+    per_file_vars_long: Dict[str, Set[str]] = {}
     time_spans: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     lat_names = set()
     lon_names = set()
@@ -507,12 +621,21 @@ def _preflight_report(paths: List[str], engines: Dict[str, str], debug: bool):
             ds = xr.open_dataset(
                 p, engine=engines[p], decode_times=True, chunks={}, cache=False
             )
-            all_vars |= set(ds.data_vars)
-            per_file_vars[p] = set(ds.data_vars)
-            if "time" in ds:
+            # Map to long names for checks
+            present = set(ds.data_vars)
+            mapped = {VAR_ALIASES_SHORT_TO_LONG.get(v, v) for v in present}
+            all_vars |= mapped
+            per_file_vars_long[p] = mapped
+            # time span (normalize if needed)
+            if "valid_time" in ds:
+                tvals = ds["valid_time"].values
+            elif "time" in ds:
+                tvals = ds["time"].values
+            else:
+                tvals = None
+            if tvals is not None:
                 try:
-                    v = ds["time"].values
-                    time_spans[p] = (str(v.min()), str(v.max()))
+                    time_spans[p] = (str(tvals.min()), str(tvals.max()))
                 except Exception:
                     time_spans[p] = (None, None)
             for cand in ("latitude", "lat", "y"):
@@ -522,18 +645,20 @@ def _preflight_report(paths: List[str], engines: Dict[str, str], debug: bool):
                 if cand in ds.coords:
                     lon_names.add(cand)
             if debug:
-                log("probe:", _brief_ds_summary(ds, p))
+                # show a normalized view
+                _dsn = _normalize_dataset(ds)
+                log("probe:", _brief_ds_summary(_dsn, p))
             ds.close()
         except Exception as e:
             log(f"warning: preflight could not open {p}: {e}")
 
     if debug:
         log(
-            f"preflight: union of variables across {len(paths)} files = {sorted(all_vars)}"
+            f"preflight: union of variables (long names) across {len(paths)} files = {sorted(all_vars)}"
         )
         # Any file missing expected VARS?
         for p in paths:
-            missing = [v for v in VARS if v not in per_file_vars.get(p, set())]
+            missing = [v for v in VARS if v not in per_file_vars_long.get(p, set())]
             if missing:
                 log(f"preflight: {os.path.basename(p)} missing variables: {missing}")
         # coord name consistency
@@ -553,8 +678,8 @@ def merge_parts(
     """
     Robust, batch-wise merge that avoids HDF5 locking stalls and slow graph builds.
     - Opens files one-by-one (fast fail), logs progress.
+    - Normalizes coords/vars (time, expver, number, aliases).
     - Merges in batches, then merges the batches.
-    - Uses override semantics to avoid attribute/coord conflicts.
 
     Returns (merged_ok, used_part_paths).
     """
@@ -597,18 +722,7 @@ def merge_parts(
                     use_cftime=None,  # let xarray auto-choose
                     cache=False,
                 )
-                # normalize/sort time; drop duplicate times (keep first)
-                if "time" in ds:
-                    try:
-                        ds = ds.sortby("time")
-                        import numpy as np  # local import
-
-                        vals = ds["time"].values
-                        _, idx = np.unique(vals, return_index=True)
-                        if len(idx) != ds.sizes.get("time", len(idx)):
-                            ds = ds.isel(time=sorted(idx))
-                    except Exception:
-                        pass
+                ds = _normalize_dataset(ds)
                 return ds, eng
             except Exception as e:
                 last = e
