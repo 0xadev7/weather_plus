@@ -49,31 +49,23 @@ def as_tg(arr, T, G):
     )
 
 
+def _safe_get(obj, *keys, default=None):
+    cur = obj
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+# -------------------------
+# Robust lat/lon parsing
+# -------------------------
 def _get_lat_lon_lists(j):
     """
-    Return (lat_list, lon_list) as floats, handling many schemas:
-
-    Accepts all of these (and mixes of them):
-      A) Explicit arrays:
-         - meta.lat / meta.lon
-         - meta.lats / meta.lons
-         - meta.latitude / meta.longitude
-         - meta.grid.lat / meta.grid.lon
-         - coords.lat / coords.lon
-         - om.latitude / om.longitude
-         - om.meta.lat / om.meta.lon
-         - om.grid.lat / om.grid.lon
-         - grid.lat / grid.lon
-      B) Points:
-         - *.grid.points = [{lat:.., lon:..}, ...]
-         - *.points = [...]
-      C) Descriptors (build arrays from a spec):
-         - {values:[...]}
-         - {start:.., stop:.., num:..} or {min:.., max:.., n:..}
-         - {start:.., step:.., count:..} (inclusive of endpoints)
-      D) Bounding box + resolution:
-         - meta.bbox + meta.nx/meta.ny OR meta.n
-         - meta.bbox with keys: north/south/east/west OR lat_min/lat_max/lon_min/lon_max
+    Return (lat_list, lon_list) as floats, handling many schemas (arrays, points,
+    descriptors, bbox+resolution). This is the robust version that tolerates
+    dict descriptors and mixed types.
     """
 
     def dig(root, dotted):
@@ -94,31 +86,18 @@ def _get_lat_lon_lists(j):
     def _ensure_sorted_unique(vals):
         return [float(v) for v in sorted(set(round(float(v), 7) for v in vals))]
 
-    # ---- descriptor -> sequence ------------------------------------------------
     def _from_descriptor(desc, axis="lat"):
-        """
-        Turn a dict descriptor into a float list.
-        Supported:
-          - {'values': [...]}
-          - {'start': a, 'stop': b, 'num': N}
-          - {'min': a, 'max': b, 'n': N}
-          - {'start': a, 'step': s, 'count': N}
-        """
         if not isinstance(desc, dict):
             return None
-        # direct values
         if "values" in desc and isinstance(desc["values"], (list, tuple)):
             out = []
             for v in desc["values"]:
                 try:
                     out.append(_as_float(v))
                 except Exception:
-                    continue
+                    pass
             return out if out else None
-
-        # start/stop/num | min/max/n
-        keys1 = [("start", "stop", "num"), ("min", "max", "n")]
-        for a, b, n in keys1:
+        for a, b, n in (("start", "stop", "num"), ("min", "max", "n")):
             if a in desc and b in desc and n in desc:
                 try:
                     a_v, b_v = _as_float(desc[a]), _as_float(desc[b])
@@ -128,8 +107,6 @@ def _get_lat_lon_lists(j):
                     return list(np.linspace(a_v, b_v, n_v))
                 except Exception:
                     pass
-
-        # start/step/count
         if all(k in desc for k in ("start", "step", "count")):
             try:
                 start = _as_float(desc["start"])
@@ -140,60 +117,39 @@ def _get_lat_lon_lists(j):
                 return [start + i * step for i in range(cnt)]
             except Exception:
                 pass
-
-        # sometimes nested: {'array': [...]} or {'data': [...]}
         for k in ("array", "data"):
             if k in desc and isinstance(desc[k], (list, tuple)):
                 try:
                     return [_as_float(v) for v in desc[k]]
                 except Exception:
                     pass
-
         return None
 
-    # ---- bbox + resolution -----------------------------------------------------
     def _from_bbox(meta):
-        """
-        Build lat/lon lists from a bbox + nx/ny (or 'n' square).
-        bbox may be:
-          - dict with north/south/east/west
-          - dict with lat_min/lat_max/lon_min/lon_max
-          - list/tuple [lat_min, lat_max, lon_min, lon_max] (Open-Meteo-ish)
-        Resolution:
-          - nx/ny or n
-        """
         if not isinstance(meta, dict):
             return None, None
-
         bbox = meta.get("bbox")
         if bbox is None:
             return None, None
 
         def _parse_bbox(bb):
             if isinstance(bb, dict):
-                # named keys
                 if all(k in bb for k in ("south", "north", "west", "east")):
                     return (
-                        _as_float(bb["south"]),
-                        _as_float(bb["north"]),
-                        _as_float(bb["west"]),
-                        _as_float(bb["east"]),
+                        float(bb["south"]),
+                        float(bb["north"]),
+                        float(bb["west"]),
+                        float(bb["east"]),
                     )
                 if all(k in bb for k in ("lat_min", "lat_max", "lon_min", "lon_max")):
                     return (
-                        _as_float(bb["lat_min"]),
-                        _as_float(bb["lat_max"]),
-                        _as_float(bb["lon_min"]),
-                        _as_float(bb["lon_max"]),
+                        float(bb["lat_min"]),
+                        float(bb["lat_max"]),
+                        float(bb["lon_min"]),
+                        float(bb["lon_max"]),
                     )
             elif isinstance(bb, (list, tuple)) and len(bb) == 4:
-                # assume [lat_min, lat_max, lon_min, lon_max]
-                return (
-                    _as_float(bb[0]),
-                    _as_float(bb[1]),
-                    _as_float(bb[2]),
-                    _as_float(bb[3]),
-                )
+                return (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
             return None
 
         parsed = _parse_bbox(bbox)
@@ -208,7 +164,6 @@ def _get_lat_lon_lists(j):
             if nx is None and ny is None and n is not None:
                 nx = ny = int(n)
             if nx is None or ny is None:
-                # also allow 'res' or 'resolution' as approximate count per axis
                 res = meta.get("res") or meta.get("resolution")
                 if res is not None:
                     nx = ny = int(res)
@@ -216,16 +171,13 @@ def _get_lat_lon_lists(j):
             ny = int(ny) if ny is not None else None
         except Exception:
             nx = ny = None
-
         if not nx or not ny:
             return None, None
 
-        # Build inclusive ranges
         lat_list = list(np.linspace(lat_min, lat_max, ny))
         lon_list = list(np.linspace(lon_min, lon_max, nx))
         return lat_list, lon_list
 
-    # ---- heterogeneous list -> floats -----------------------------------------
     def _to_float_seq(seq, key_candidates=("lat", "latitude", "y", "value")):
         out = []
         for x in seq:
@@ -234,7 +186,6 @@ def _get_lat_lon_lists(j):
                 continue
             except Exception:
                 pass
-            # descriptors embedded in the list
             if isinstance(x, dict):
                 vals = _from_descriptor(x)
                 if vals:
@@ -267,21 +218,20 @@ def _get_lat_lon_lists(j):
                 for k in ("lat", "latitude", "y"):
                     if k in p:
                         try:
-                            la = _as_float(p[k])
+                            la = float(p[k])
                             break
                         except Exception:
                             pass
                 for k in ("lon", "longitude", "x"):
                     if k in p:
                         try:
-                            lo = _as_float(p[k])
+                            lo = float(p[k])
                             break
                         except Exception:
                             pass
             elif isinstance(p, (list, tuple)) and len(p) >= 2:
                 try:
-                    la = _as_float(p[0])
-                    lo = _as_float(p[1])
+                    la, lo = float(p[0]), float(p[1])
                 except Exception:
                     pass
             if la is not None and lo is not None:
@@ -291,7 +241,6 @@ def _get_lat_lon_lists(j):
             return _ensure_sorted_unique(lats), _ensure_sorted_unique(lons)
         return None, None
 
-    # 1) Try explicit array pairs first (and allow descriptors at those paths)
     array_pairs = [
         ("meta.lat", "meta.lon"),
         ("meta.lats", "meta.lons"),
@@ -307,69 +256,57 @@ def _get_lat_lon_lists(j):
         lat_raw, lon_raw = dig(j, p_lat), dig(j, p_lon)
         if lat_raw is None or lon_raw is None:
             continue
-
-        # if dict descriptors
-        if isinstance(lat_raw, dict):
-            lat = _from_descriptor(lat_raw, axis="lat")
-        else:
-            lat = _to_float_seq(lat_raw)
-
-        if isinstance(lon_raw, dict):
-            lon = _from_descriptor(lon_raw, axis="lon")
-        else:
-            lon = _to_float_seq(
-                lon_raw, key_candidates=("lon", "longitude", "x", "value")
-            )
-
+        lat = (
+            _from_descriptor(lat_raw)
+            if isinstance(lat_raw, dict)
+            else _to_float_seq(lat_raw)
+        )
+        lon = (
+            _from_descriptor(lon_raw)
+            if isinstance(lon_raw, dict)
+            else _to_float_seq(lon_raw, ("lon", "longitude", "x", "value"))
+        )
         if lat and lon:
             return lat, lon
 
-    # 2) Points-style schemas
-    point_candidates = [
+    for path in (
         "meta.grid.points",
         "meta.points",
         "om.grid.points",
         "om.points",
         "coords.points",
         "grid.points",
-    ]
-    for path in point_candidates:
+    ):
         seq = dig(j, path)
         if isinstance(seq, (list, tuple)) and seq:
             lat, lon = _from_points(seq)
             if lat and lon:
                 return lat, lon
 
-    # 3) Descriptor-only lat/lon at common locations (e.g., meta.lat is a descriptor)
     for p_lat, p_lon in array_pairs:
         lat_raw, lon_raw = dig(j, p_lat), dig(j, p_lon)
         if isinstance(lat_raw, dict) and isinstance(lon_raw, dict):
-            lat = _from_descriptor(lat_raw, axis="lat")
-            lon = _from_descriptor(lon_raw, axis="lon")
+            lat, lon = _from_descriptor(lat_raw), _from_descriptor(lon_raw)
             if lat and lon:
                 return lat, lon
 
-    # 4) BBox + resolution on meta or top-level
-    for node in (j.get("meta", {}), j):
+    for node in (j.get("meta", {}) or {}, j):
         lat, lon = _from_bbox(node)
         if lat and lon:
             return lat, lon
 
-    # 5) Some dumps put everything under a single 'grid' dict with descriptors
     grid = j.get("grid")
     if isinstance(grid, dict):
         lat_raw, lon_raw = grid.get("lat"), grid.get("lon")
         lat = (
-            _from_descriptor(lat_raw, axis="lat")
+            _from_descriptor(lat_raw)
             if isinstance(lat_raw, dict)
             else _to_float_seq(lat_raw)
         )
         lon = (
-            _from_descriptor(lon_raw, axis="lon")
+            _from_descriptor(lon_raw)
             if isinstance(lon_raw, dict)
-            else _to_float_seq(
-                lon_raw, key_candidates=("lon", "longitude", "x", "value")
-            )
+            else _to_float_seq(lon_raw, ("lon", "longitude", "x", "value"))
         )
         if lat and lon:
             return lat, lon
@@ -382,13 +319,180 @@ def _get_lat_lon_lists(j):
     return None, None
 
 
-def _safe_get(obj, *keys, default=None):
-    cur = obj
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
+def _extract_grid_points(j):
+    """
+    Returns list[(lat, lon)] in the *exact* order baselines are flattened.
+
+    Priority:
+      1) meta.paired_lat / meta.paired_lon  -> zipped pairs (batch subsets)
+      2) Explicit arrays (via _get_lat_lon_lists) -> Cartesian product (flatten_grid)
+      3) meta.lat_axis / meta.lon_axis -> Cartesian product (full axes)
+    """
+    meta = j.get("meta", {}) or {}
+    p_lat = meta.get("paired_lat")
+    p_lon = meta.get("paired_lon")
+    if (
+        isinstance(p_lat, list)
+        and isinstance(p_lon, list)
+        and len(p_lat) == len(p_lon)
+        and len(p_lat) > 0
+    ):
+        try:
+            return [(float(la), float(lo)) for la, lo in zip(p_lat, p_lon)]
+        except Exception:
+            pass
+
+    lat, lon = _get_lat_lon_lists(j)
+    if lat and lon:
+        return flatten_grid(lat, lon)
+
+    lat_axis = meta.get("lat_axis")
+    lon_axis = meta.get("lon_axis")
+    if (
+        isinstance(lat_axis, list)
+        and isinstance(lon_axis, list)
+        and lat_axis
+        and lon_axis
+    ):
+        try:
+            lat = [float(x) for x in lat_axis]
+            lon = [float(x) for x in lon_axis]
+            return flatten_grid(lat, lon)
+        except Exception:
+            pass
+    return None
+
+
+# -------------------------
+# New: robust baseline parsing
+# -------------------------
+def _parse_times_from_hourly_block(block):
+    """block = {'time': [...], var1:[...], ...}"""
+    if not isinstance(block, dict) or "time" not in block:
+        return None
+    try:
+        return [dt.datetime.fromisoformat(t.replace("Z", "")) for t in block["time"]]
+    except Exception:
+        return None
+
+
+def _extract_times(j):
+    """Try om (dict/list) first; fallback to meta.start/end."""
+    om = j.get("om")
+    # om as dict with 'hourly'
+    if isinstance(om, dict) and "hourly" in om:
+        t = _parse_times_from_hourly_block(om["hourly"])
+        if t:
+            return t
+    # om as list of per-point dicts
+    if isinstance(om, list) and om:
+        hb = om[0].get("hourly", {})
+        t = _parse_times_from_hourly_block(hb)
+        if t:
+            return t
+    # fallback meta.start/end (exclusive end)
+    m = j.get("meta", {}) or {}
+    try:
+        t0 = dt.datetime.fromisoformat(m["start"])
+        t1 = dt.datetime.fromisoformat(m["end"])
+        return [
+            t0 + dt.timedelta(hours=h)
+            for h in range(int((t1 - t0).total_seconds() // 3600))
+        ]
+    except Exception:
+        return None
+
+
+def _build_matrix_from_points(point_list, name, times, grid):
+    """
+    point_list: list of {latitude, longitude, hourly:{ name: [T], ... }}
+    Returns arr shape (T, G) matching grid order.
+    """
+    T, G = len(times), len(grid)
+
+    # map (rounded lat,lon) -> vector
+    def _r(x):
+        return round(float(x), 6)
+
+    series_map = {}
+    for p in point_list:
+        la = p.get("latitude")
+        lo = p.get("longitude")
+        hb = p.get("hourly", {}) or {}
+        vals = hb.get(name)
+        if la is None or lo is None or vals is None:
+            continue
+        v = np.asarray(vals, dtype=float)
+        if v.size != T:
+            # if time lengths vary, try to align via reported time when present
+            p_times = _parse_times_from_hourly_block(hb)
+            if p_times and len(p_times) == v.size:
+                # simple nearest-hour alignment to global 'times'
+                aligned = np.empty(T, dtype=float)
+                for i, tt in enumerate(times):
+                    j = int(
+                        np.argmin([abs((tt - pt).total_seconds()) for pt in p_times])
+                    )
+                    aligned[i] = float(v[j])
+                v = aligned
+            else:
+                raise RuntimeError(
+                    f"point ({la},{lo}) var {name} length {v.size} != T={T}"
+                )
+        series_map[(_r(la), _r(lo))] = v
+
+    out = np.empty((T, G), dtype=float)
+    missing = 0
+    for gi, (la, lo) in enumerate(grid):
+        key = (_r(la), _r(lo))
+        if key not in series_map:
+            missing += 1
+            # If missing, fill NaN and let downstream skip/handle
+            out[:, gi] = np.nan
+        else:
+            out[:, gi] = series_map[key]
+    if missing and missing == G:
+        raise KeyError(f"no points matched grid for var {name}")
+    return out
+
+
+def _parse_baseline(j, key, times, grid, required_vars):
+    """
+    key: 'om' or 'ifs'
+    Returns dict: var_name -> (T,G) ndarray or None if not available.
+    Accepts dict-with-hourly or list-of-points schema.
+    """
+    blk = j.get(key, None)
+    if blk is None:
+        return {v: None for v in required_vars}
+
+    T, G = len(times), len(grid)
+
+    if isinstance(blk, dict) and "hourly" in blk:
+        hourly = blk["hourly"] or {}
+        out = {}
+        for v in required_vars:
+            arr = hourly.get(v)
+            if arr is None:
+                out[v] = None
+            else:
+                out[v] = as_tg(arr, T, G if np.ndim(arr) > 1 else 1)  # tolerate 1D
+                if out[v].shape == (T, 1) and G > 1:
+                    # If it's truly a single point but grid > 1, broadcast if that's expected
+                    out[v] = np.repeat(out[v], G, axis=1)
+        return out
+
+    if isinstance(blk, list):
+        out = {}
+        for v in required_vars:
+            try:
+                out[v] = _build_matrix_from_points(blk, v, times, grid)
+            except KeyError:
+                out[v] = None
+        return out
+
+    # Unknown schema
+    return {v: None for v in required_vars}
 
 
 def main():
@@ -407,6 +511,15 @@ def main():
     if not files:
         raise SystemExit("No OM baseline files found")
 
+    needed = [
+        "temperature_2m",
+        "dew_point_2m",
+        "surface_pressure",
+        "precipitation",
+        "wind_speed_100m",
+        "wind_direction_100m",
+    ]
+
     for p in files:
         try:
             with open(p, "r") as f:
@@ -415,38 +528,16 @@ def main():
             print(f"[pair] skip {os.path.basename(p)} (invalid JSON: {e})")
             continue
 
-        # Pull hourly block(s)
-        om = _safe_get(j, "om", "hourly", default=None)
-        ifs = _safe_get(j, "ifs", "hourly", default=None)
-
-        # Times
-        times = None
-        if om is not None and "time" in om:
-            try:
-                times = [
-                    dt.datetime.fromisoformat(t.replace("Z", "")) for t in om["time"]
-                ]
-            except Exception as e:
-                print(f"[pair] skip {os.path.basename(p)} (bad time array: {e})")
-                continue
-        else:
-            # Fallback: meta.start/meta.end hourly range
-            m = j.get("meta", {}) or {}
-            try:
-                t0 = dt.datetime.fromisoformat(m["start"])
-                t1 = dt.datetime.fromisoformat(m["end"])
-                # inclusive of start, exclusive of end; hourly steps
-                times = [
-                    t0 + dt.timedelta(hours=h)
-                    for h in range(int((t1 - t0).total_seconds() // 3600))
-                ]
-            except Exception:
-                print(f"[pair] skip {os.path.basename(p)} (missing om.hourly.time)")
-                continue
-
+        # Grid (ordered)
         grid = _extract_grid_points(j)
         if not grid:
             print(f"[pair] skip {os.path.basename(p)} (unable to parse lat/lon grid)")
+            continue
+
+        # Times
+        times = _extract_times(j)
+        if not times:
+            print(f"[pair] skip {os.path.basename(p)} (unable to parse times)")
             continue
         T, G = len(times), len(grid)
         if T == 0 or G == 0:
@@ -459,28 +550,64 @@ def main():
         )
         hods = np.array([t.hour + t.minute / 60 for t in times], dtype=float)
 
-        # Baseline helpers
-        def base(name):
-            # OM may store arrays per location in flattened order matching grid
-            if name not in om:
-                raise KeyError(name)
-            om_arr = as_tg(om[name], T, G)
-            ifs_arr = None
-            if ifs is not None and name in ifs:
-                ifs_arr = as_tg(ifs[name], T, G)
-            return om_arr, ifs_arr
+        # Parse baselines (robust to both schemas)
+        om_vars = _parse_baseline(j, "om", times, grid, needed)
+        ifs_vars = _parse_baseline(j, "ifs", times, grid, needed)
+
+        # Ensure required OM variables present
+        missing_keys = [k for k in needed if om_vars.get(k) is None]
+        if missing_keys:
+            print(
+                f"[pair] skip {os.path.basename(p)} (missing OM keys: {missing_keys})"
+            )
+            continue
+
+        # Aliases
+        b_t2m_om = om_vars["temperature_2m"]
+        b_td2m_om = om_vars["dew_point_2m"]
+        b_psfc_om = om_vars["surface_pressure"]
+        b_tp_om = om_vars["precipitation"]
+        b_wspd_om = om_vars["wind_speed_100m"]
+        b_wdir_om = om_vars["wind_direction_100m"]
+
+        b_t2m_ifs = ifs_vars.get("temperature_2m")
+        b_td2m_ifs = ifs_vars.get("dew_point_2m")
+        b_psfc_ifs = ifs_vars.get("surface_pressure")
+        b_tp_ifs = ifs_vars.get("precipitation")
+        b_wspd_ifs = ifs_vars.get("wind_speed_100m")
+        b_wdir_ifs = ifs_vars.get("wind_direction_100m")
+
+        # Broadcast single-column OM to G if needed (defensive)
+        def _ensure_TG(a):
+            a = np.asarray(a)
+            if a.shape == (T,):
+                a = a[:, None]
+            if a.shape == (T, 1) and G > 1:
+                a = np.repeat(a, G, axis=1)
+            if a.shape != (T, G):
+                raise RuntimeError(f"baseline shape mismatch {a.shape}, want {(T,G)}")
+            return a
 
         try:
-            b_t2m_om, b_t2m_ifs = base("temperature_2m")
-            b_td2m_om, b_td2m_ifs = base("dew_point_2m")
-            b_psfc_om, b_psfc_ifs = base("surface_pressure")
-            b_tp_om, b_tp_ifs = base("precipitation")
-            b_wspd_om, b_wspd_ifs = base("wind_speed_100m")
-            b_wdir_om, b_wdir_ifs = base("wind_direction_100m")
-        except KeyError as e:
-            print(f"[pair] skip {os.path.basename(p)} (missing baseline key: {e})")
-            continue
-        except RuntimeError as e:
+            b_t2m_om = _ensure_TG(b_t2m_om)
+            b_td2m_om = _ensure_TG(b_td2m_om)
+            b_psfc_om = _ensure_TG(b_psfc_om)
+            b_tp_om = _ensure_TG(b_tp_om)
+            b_wspd_om = _ensure_TG(b_wspd_om)
+            b_wdir_om = _ensure_TG(b_wdir_om)
+            if b_t2m_ifs is not None:
+                b_t2m_ifs = _ensure_TG(b_t2m_ifs)
+            if b_td2m_ifs is not None:
+                b_td2m_ifs = _ensure_TG(b_td2m_ifs)
+            if b_psfc_ifs is not None:
+                b_psfc_ifs = _ensure_TG(b_psfc_ifs)
+            if b_tp_ifs is not None:
+                b_tp_ifs = _ensure_TG(b_tp_ifs)
+            if b_wspd_ifs is not None:
+                b_wspd_ifs = _ensure_TG(b_wspd_ifs)
+            if b_wdir_ifs is not None:
+                b_wdir_ifs = _ensure_TG(b_wdir_ifs)
+        except Exception as e:
             print(f"[pair] skip {os.path.basename(p)} (shape issue: {e})")
             continue
 
@@ -517,7 +644,6 @@ def main():
                 )
             else:
                 sp_truth = pa_to_hpa(nearest_truth(era5_single, "sp", grid, times))
-
             u100 = nearest_truth(era5_single, "u100", grid, times)
             v100 = nearest_truth(era5_single, "v100", grid, times)
             wspd_truth = ms_to_kmh(np.hypot(u100, v100))
@@ -530,7 +656,11 @@ def main():
             for gi, (la, lo) in enumerate(grid):
                 for ti, tt in enumerate(times):
                     bomv = float(bom[ti, gi])
-                    bifsv = float(bifs[ti, gi]) if bifs is not None else np.nan
+                    bifsv = (
+                        float(bifs[ti, gi])
+                        if (bifs is not None and np.isfinite(bifs[ti, gi]))
+                        else np.nan
+                    )
                     rows_list.append(
                         {
                             "lat": la,
@@ -542,7 +672,7 @@ def main():
                             "baseline_diff": bomv
                             - (bifsv if np.isfinite(bifsv) else bomv),
                             "target": float(truth[ti, gi]),
-                            "time": tt.isoformat(),
+                            "time": times[ti].isoformat(),
                         }
                     )
 
@@ -572,57 +702,6 @@ def main():
             print(
                 f"[pair] warning: empty dataframe for {outname} on {args.tile_id} (no matching OM files / coords?)"
             )
-
-
-def _extract_grid_points(j):
-    """
-    Returns list[(lat, lon)] in the *exact* order baselines are flattened.
-
-    Priority:
-      1) meta.paired_lat / meta.paired_lon  -> zipped pairs (batch subsets)
-      2) Explicit arrays (via _get_lat_lon_lists) -> Cartesian product (flatten_grid)
-      3) meta.lat_axis / meta.lon_axis -> Cartesian product (full axes)
-    """
-    meta = j.get("meta", {}) or {}
-
-    # 1) Paired (batched) coordinates — keep order exactly as given
-    p_lat = meta.get("paired_lat")
-    p_lon = meta.get("paired_lon")
-    if (
-        isinstance(p_lat, list)
-        and isinstance(p_lon, list)
-        and len(p_lat) == len(p_lon)
-        and len(p_lat) > 0
-    ):
-        try:
-            glist = [(float(la), float(lo)) for la, lo in zip(p_lat, p_lon)]
-            return glist
-        except Exception:
-            pass  # fall through if any bad values
-
-    # 2) Try any of the many array schemas you already support
-    lat, lon = _get_lat_lon_lists(j)
-    if lat and lon:
-        return flatten_grid(lat, lon)
-
-    # 3) Axes (full grid) — Open-Meteo often uses these
-    lat_axis = meta.get("lat_axis")
-    lon_axis = meta.get("lon_axis")
-    if (
-        isinstance(lat_axis, list)
-        and isinstance(lon_axis, list)
-        and lat_axis
-        and lon_axis
-    ):
-        try:
-            lat = [float(x) for x in lat_axis]
-            lon = [float(x) for x in lon_axis]
-            return flatten_grid(lat, lon)
-        except Exception:
-            pass
-
-    # Nothing found
-    return None
 
 
 if __name__ == "__main__":
