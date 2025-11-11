@@ -21,10 +21,9 @@ class WspdModel:
         self.inner = inner
 
     def predict(self, Xfull):
-        # Xfull: [lat,lon,hod,lead,baseline_om,baseline_ifs,baseline_diff]
         base1 = np.sqrt(np.clip(Xfull[:, 4], 0, None))
         base2 = np.sqrt(np.clip(np.nan_to_num(Xfull[:, 5], nan=Xfull[:, 4]), 0, None))
-        Z = np.column_stack([Xfull[:, 0:4], base1, base2, (base1 - base2)])
+        Z = np.column_stack([Xfull[:, 0:4], base1, base2])
         y = self.inner.predict(Z)
         return np.clip(y**2, 0, None)
 

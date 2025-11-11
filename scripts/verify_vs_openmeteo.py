@@ -7,9 +7,7 @@ MODEL_DIR = os.getenv("MODEL_DIR", "./models")
 
 def eval_one(df_path, model_name, unit_note=""):
     df = pd.read_parquet(df_path)
-    X = df[
-        ["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs", "baseline_diff"]
-    ].values
+    X = df[["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs"]].values
     y = df["target"].values
     bom = df["baseline_om"].values
     bifs = np.nan_to_num(df["baseline_ifs"].values, nan=bom)

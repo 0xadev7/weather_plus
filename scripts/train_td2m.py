@@ -4,9 +4,7 @@ from sklearn.linear_model import Ridge
 from weather_plus.config import MODEL_DIR
 
 df = pd.read_parquet("data/train/td2m_training.parquet")
-X = df[
-    ["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs", "baseline_diff"]
-].values
+X = df[["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs"]].values
 y = df["target"].values
 m = Ridge(alpha=0.8).fit(X, y)
 os.makedirs(MODEL_DIR, exist_ok=True)

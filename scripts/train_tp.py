@@ -5,9 +5,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from weather_plus.config import MODEL_DIR
 
 df = pd.read_parquet("data/train/tp_training.parquet")
-Xb = df[
-    ["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs", "baseline_diff"]
-].values
+Xb = df[["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs"]].values
 y = df["target"].values
 is_rain = (y > 0.05).astype(int)
 

@@ -106,10 +106,9 @@ def forecast(req: ForecastRequest):
         else:
             vec_ifs = np.full_like(vec_om, np.nan)
 
-        # Features: [lat, lon, hod, lead, baseline_om, baseline_ifs_filled, baseline_diff]
+        # Features: [lat, lon, hod, lead, baseline_om, baseline_ifs_filled]
         vec_ifs_filled = np.nan_to_num(vec_ifs, nan=vec_om)
-        base_diff = vec_om - vec_ifs_filled
-        X = np.column_stack([X_basic, vec_om, vec_ifs_filled, base_diff])  # [T*G, 7]
+        X = np.column_stack([X_basic, vec_om, vec_ifs_filled])  # [T*G, 7]
 
         # 4) Tile-aware calibration (batch by tile for fewer Python calls)
         yhat = np.empty_like(vec_om, dtype=float)

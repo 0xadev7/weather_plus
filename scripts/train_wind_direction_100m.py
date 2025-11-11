@@ -4,9 +4,7 @@ from sklearn.linear_model import Ridge
 from weather_plus.config import MODEL_DIR
 
 df = pd.read_parquet("data/train/wdir100_training.parquet")
-X = df[
-    ["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs", "baseline_diff"]
-].values
+X = df[["lat", "lon", "hod", "lead", "baseline_om", "baseline_ifs"]].values
 theta = np.deg2rad(df["target"].values)
 y_sin = np.sin(theta)
 y_cos = np.cos(theta)
