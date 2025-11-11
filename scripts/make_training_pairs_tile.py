@@ -611,17 +611,92 @@ def main():
             print(f"[pair] skip {os.path.basename(p)} (shape issue: {e})")
             continue
 
-        # Truth samplers
+        # --- robust coord/time helpers ------------------------------------------------
+        def _coord_values(ds, candidates):
+            """Return the first matching coordinate's numpy array for any of the candidate names."""
+            for name in candidates:
+                if name in ds.coords:
+                    return ds.coords[name].values
+                if (
+                    name in ds.dims and name in ds
+                ):  # sometimes coords also appear as data vars
+                    try:
+                        return ds[name].values
+                    except Exception:
+                        pass
+            raise KeyError(
+                f"None of coord names {candidates} found in dataset: {list(ds.coords)}"
+            )
+
+        def _time_list(ds):
+            """
+            Return a Python list[datetime] for the dataset's time-like coordinate.
+            Tries common names and tolerates non-pandas indexes.
+            """
+            # prefer coords; fall back to dims-as-vars
+            tvals = _coord_values(ds, ("time", "valid_time", "t"))
+            # normalize to python datetimes
+            try:
+                import pandas as _pd
+
+                return [
+                    ts.to_pydatetime().replace(tzinfo=None)
+                    for ts in _pd.to_datetime(tvals)
+                ]
+            except Exception:
+                # final fallback via numpy
+                return [
+                    np.datetime64(x)
+                    .astype("datetime64[ms]")
+                    .astype(object)
+                    .replace(tzinfo=None)
+                    for x in tvals
+                ]
+
+        def _lat_vals(ds):
+            return _coord_values(ds, ("latitude", "lat", "y"))
+
+        def _lon_vals(ds):
+            return _coord_values(ds, ("longitude", "lon", "x"))
+
+        def _wrap_lon_for_coords(lon_coords, target_lon):
+            """
+            If dataset longitudes are 0..360 and target is -180..180, wrap target into same range.
+            """
+            lon_coords = np.asarray(lon_coords)
+            lo = float(target_lon)
+            if lon_coords.min() >= 0.0 and lon_coords.max() > 180.0:
+                # dataset uses 0..360
+                if lo < 0.0:
+                    lo = (lo + 360.0) % 360.0
+            else:
+                # dataset likely -180..180; also map 0..360 targets back if needed
+                if lo > 180.0:
+                    lo = ((lo + 180.0) % 360.0) - 180.0
+            return lo
+
+        # --- replacement: robust ERA5 nearest sampler --------------------------------
         def nearest_truth(ds, var, grid, times):
-            lats = ds.coords["latitude"].values
-            lons = ds.coords["longitude"].values
-            tlist = pd_index_to_pylist(ds.indexes["time"])
+            lats = _lat_vals(ds)
+            lons = _lon_vals(ds)
+            tlist = _time_list(ds)  # python datetimes
+
+            T, G = len(times), len(grid)
             out = np.empty((T, G), dtype=float)
+
+            # precompute for speed
+            lats = np.asarray(lats)
+            lons = np.asarray(lons)
+
             for gi, (la, lo) in enumerate(grid):
-                ilat = nearest_idx(lats, la)
-                ilon = nearest_idx(lons, lo)
+                # wrap longitude if grid uses -180..180 but dataset is 0..360 (or vice versa)
+                lo_adj = _wrap_lon_for_coords(lons, lo)
+                ilat = int(np.argmin(np.abs(lats - la)))
+                ilon = int(np.argmin(np.abs(lons - lo_adj)))
                 for ti, tt in enumerate(times):
-                    it = nearest_idx(tlist, tt)
+                    it = int(
+                        np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])
+                    )
                     out[ti, gi] = float(
                         ds[var].isel(latitude=ilat, longitude=ilon, time=it).values
                     )
