@@ -62,12 +62,6 @@ def _safe_get(obj, *keys, default=None):
 # Robust lat/lon parsing
 # -------------------------
 def _get_lat_lon_lists(j):
-    """
-    Return (lat_list, lon_list) as floats, handling many schemas (arrays, points,
-    descriptors, bbox+resolution). This is the robust version that tolerates
-    dict descriptors and mixed types.
-    """
-
     def dig(root, dotted):
         cur = root
         for k in dotted.split("."):
@@ -320,14 +314,6 @@ def _get_lat_lon_lists(j):
 
 
 def _extract_grid_points(j):
-    """
-    Returns list[(lat, lon)] in the *exact* order baselines are flattened.
-
-    Priority:
-      1) meta.paired_lat / meta.paired_lon  -> zipped pairs (batch subsets)
-      2) Explicit arrays (via _get_lat_lon_lists) -> Cartesian product (flatten_grid)
-      3) meta.lat_axis / meta.lon_axis -> Cartesian product (full axes)
-    """
     meta = j.get("meta", {}) or {}
     p_lat = meta.get("paired_lat")
     p_lon = meta.get("paired_lon")
@@ -364,10 +350,9 @@ def _extract_grid_points(j):
 
 
 # -------------------------
-# New: robust baseline parsing
+# Baseline parsing
 # -------------------------
 def _parse_times_from_hourly_block(block):
-    """block = {'time': [...], var1:[...], ...}"""
     if not isinstance(block, dict) or "time" not in block:
         return None
     try:
@@ -377,20 +362,16 @@ def _parse_times_from_hourly_block(block):
 
 
 def _extract_times(j):
-    """Try om (dict/list) first; fallback to meta.start/end."""
     om = j.get("om")
-    # om as dict with 'hourly'
     if isinstance(om, dict) and "hourly" in om:
         t = _parse_times_from_hourly_block(om["hourly"])
         if t:
             return t
-    # om as list of per-point dicts
     if isinstance(om, list) and om:
         hb = om[0].get("hourly", {})
         t = _parse_times_from_hourly_block(hb)
         if t:
             return t
-    # fallback meta.start/end (exclusive end)
     m = j.get("meta", {}) or {}
     try:
         t0 = dt.datetime.fromisoformat(m["start"])
@@ -404,13 +385,8 @@ def _extract_times(j):
 
 
 def _build_matrix_from_points(point_list, name, times, grid):
-    """
-    point_list: list of {latitude, longitude, hourly:{ name: [T], ... }}
-    Returns arr shape (T, G) matching grid order.
-    """
     T, G = len(times), len(grid)
 
-    # map (rounded lat,lon) -> vector
     def _r(x):
         return round(float(x), 6)
 
@@ -424,10 +400,8 @@ def _build_matrix_from_points(point_list, name, times, grid):
             continue
         v = np.asarray(vals, dtype=float)
         if v.size != T:
-            # if time lengths vary, try to align via reported time when present
             p_times = _parse_times_from_hourly_block(hb)
             if p_times and len(p_times) == v.size:
-                # simple nearest-hour alignment to global 'times'
                 aligned = np.empty(T, dtype=float)
                 for i, tt in enumerate(times):
                     j = int(
@@ -447,7 +421,6 @@ def _build_matrix_from_points(point_list, name, times, grid):
         key = (_r(la), _r(lo))
         if key not in series_map:
             missing += 1
-            # If missing, fill NaN and let downstream skip/handle
             out[:, gi] = np.nan
         else:
             out[:, gi] = series_map[key]
@@ -457,11 +430,6 @@ def _build_matrix_from_points(point_list, name, times, grid):
 
 
 def _parse_baseline(j, key, times, grid, required_vars):
-    """
-    key: 'om' or 'ifs'
-    Returns dict: var_name -> (T,G) ndarray or None if not available.
-    Accepts dict-with-hourly or list-of-points schema.
-    """
     blk = j.get(key, None)
     if blk is None:
         return {v: None for v in required_vars}
@@ -476,9 +444,8 @@ def _parse_baseline(j, key, times, grid, required_vars):
             if arr is None:
                 out[v] = None
             else:
-                out[v] = as_tg(arr, T, G if np.ndim(arr) > 1 else 1)  # tolerate 1D
+                out[v] = as_tg(arr, T, G if np.ndim(arr) > 1 else 1)
                 if out[v].shape == (T, 1) and G > 1:
-                    # If it's truly a single point but grid > 1, broadcast if that's expected
                     out[v] = np.repeat(out[v], G, axis=1)
         return out
 
@@ -491,8 +458,59 @@ def _parse_baseline(j, key, times, grid, required_vars):
                 out[v] = None
         return out
 
-    # Unknown schema
     return {v: None for v in required_vars}
+
+
+# -------------------------
+# NEW: robust ERA5 variable resolution
+# -------------------------
+VAR_ALIASES = {
+    # target_key : possible names in files (short, long, OM-like)
+    "t2m": ["t2m", "2m_temperature", "temperature_2m"],
+    "d2m": [
+        "d2m",
+        "2m_dewpoint_temperature",
+        "dew_point_2m",
+        "dewpoint_temperature_2m",
+    ],
+    "tp": ["tp", "total_precipitation", "precipitation"],
+    "sp": ["sp", "surface_pressure"],
+    "u100": ["u100", "100m_u_component_of_wind"],
+    "v100": ["v100", "100m_v_component_of_wind"],
+    # (optionally used elsewhere)
+    "u10": ["u10", "10m_u_component_of_wind"],
+    "v10": ["v10", "10m_v_component_of_wind"],
+}
+
+
+def _find_var_name(ds: xr.Dataset, key: str) -> str:
+    """
+    Return the actual data_var name in ds that matches our logical key
+    using aliases (case-insensitive). Raises KeyError if not found.
+    """
+    aliases = VAR_ALIASES.get(key, [key])
+    data_vars_lower = {name.lower(): name for name in ds.data_vars}
+    for cand in aliases:
+        name = data_vars_lower.get(cand.lower())
+        if name is not None:
+            return name
+    # sometimes variables are stored as coords (rare); include coords too
+    coords_lower = {name.lower(): name for name in ds.coords}
+    for cand in aliases:
+        name = coords_lower.get(cand.lower())
+        if name is not None:
+            return name
+    raise KeyError(
+        f"No variable named {aliases!r}. Variables on the dataset include {list(ds.data_vars)}"
+    )
+
+
+def _maybe_squeeze_members(da: xr.DataArray) -> xr.DataArray:
+    """Squeeze/isel ensemble or expver-like dims if present."""
+    for extra in ("expver", "number"):
+        if extra in da.dims:
+            da = da.isel({extra: -1})
+    return da.squeeze(drop=True)
 
 
 def main():
@@ -520,6 +538,95 @@ def main():
         "wind_direction_100m",
     ]
 
+    # --- robust coord/time helpers ------------------------------------------------
+    def _coord_values(ds, candidates):
+        for name in candidates:
+            if name in ds.coords:
+                return ds.coords[name].values
+            if name in ds.dims and name in ds:
+                try:
+                    return ds[name].values
+                except Exception:
+                    pass
+        raise KeyError(
+            f"None of coord names {candidates} found in dataset: {list(ds.coords)}"
+        )
+
+    def _time_list(ds):
+        tvals = _coord_values(ds, ("time", "valid_time", "t"))
+        try:
+            import pandas as _pd
+
+            return [
+                ts.to_pydatetime().replace(tzinfo=None) for ts in _pd.to_datetime(tvals)
+            ]
+        except Exception:
+            return [
+                np.datetime64(x)
+                .astype("datetime64[ms]")
+                .astype(object)
+                .replace(tzinfo=None)
+                for x in tvals
+            ]
+
+    def _lat_vals(ds):
+        return _coord_values(ds, ("latitude", "lat", "y"))
+
+    def _lon_vals(ds):
+        return _coord_values(ds, ("longitude", "lon", "x"))
+
+    def _wrap_lon_for_coords(lon_coords, target_lon):
+        lon_coords = np.asarray(lon_coords)
+        lo = float(target_lon)
+        if lon_coords.min() >= 0.0 and lon_coords.max() > 180.0:
+            if lo < 0.0:
+                lo = (lo + 360.0) % 360.0
+        else:
+            if lo > 180.0:
+                lo = ((lo + 180.0) % 360.0) - 180.0
+        return lo
+
+    def _has_var(ds, key):
+        try:
+            _find_var_name(ds, key)
+            return True
+        except KeyError:
+            return False
+
+    def _prefer_dataset_for(key):
+        # choose the dataset that actually contains the var (by any alias)
+        if _has_var(era5_land, key):
+            return era5_land
+        if _has_var(era5_single, key):
+            return era5_single
+        # last resort: return single to raise clearer KeyError later
+        return era5_single
+
+    def nearest_truth(ds, key, grid, times):
+        # resolve actual var name via aliases and squeeze extra dims
+        vname = _find_var_name(ds, key)
+        da = _maybe_squeeze_members(ds[vname])
+
+        lats = _lat_vals(ds)
+        lons = _lon_vals(ds)
+        tlist = _time_list(ds)
+
+        T, G = len(times), len(grid)
+        out = np.empty((T, G), dtype=float)
+        lats = np.asarray(lats)
+        lons = np.asarray(lons)
+
+        for gi, (la, lo) in enumerate(grid):
+            lo_adj = _wrap_lon_for_coords(lons, lo)
+            ilat = int(np.argmin(np.abs(lats - la)))
+            ilon = int(np.argmin(np.abs(lons - lo_adj)))
+            for ti, tt in enumerate(times):
+                it = int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist]))
+                out[ti, gi] = float(
+                    da.isel(latitude=ilat, longitude=ilon, time=it).values
+                )
+        return out
+
     for p in files:
         try:
             with open(p, "r") as f:
@@ -528,13 +635,11 @@ def main():
             print(f"[pair] skip {os.path.basename(p)} (invalid JSON: {e})")
             continue
 
-        # Grid (ordered)
         grid = _extract_grid_points(j)
         if not grid:
             print(f"[pair] skip {os.path.basename(p)} (unable to parse lat/lon grid)")
             continue
 
-        # Times
         times = _extract_times(j)
         if not times:
             print(f"[pair] skip {os.path.basename(p)} (unable to parse times)")
@@ -550,11 +655,9 @@ def main():
         )
         hods = np.array([t.hour + t.minute / 60 for t in times], dtype=float)
 
-        # Parse baselines (robust to both schemas)
         om_vars = _parse_baseline(j, "om", times, grid, needed)
         ifs_vars = _parse_baseline(j, "ifs", times, grid, needed)
 
-        # Ensure required OM variables present
         missing_keys = [k for k in needed if om_vars.get(k) is None]
         if missing_keys:
             print(
@@ -562,7 +665,6 @@ def main():
             )
             continue
 
-        # Aliases
         b_t2m_om = om_vars["temperature_2m"]
         b_td2m_om = om_vars["dew_point_2m"]
         b_psfc_om = om_vars["surface_pressure"]
@@ -577,7 +679,6 @@ def main():
         b_wspd_ifs = ifs_vars.get("wind_speed_100m")
         b_wdir_ifs = ifs_vars.get("wind_direction_100m")
 
-        # Broadcast single-column OM to G if needed (defensive)
         def _ensure_TG(a):
             a = np.asarray(a)
             if a.shape == (T,):
@@ -611,116 +712,23 @@ def main():
             print(f"[pair] skip {os.path.basename(p)} (shape issue: {e})")
             continue
 
-        # --- robust coord/time helpers ------------------------------------------------
-        def _coord_values(ds, candidates):
-            """Return the first matching coordinate's numpy array for any of the candidate names."""
-            for name in candidates:
-                if name in ds.coords:
-                    return ds.coords[name].values
-                if (
-                    name in ds.dims and name in ds
-                ):  # sometimes coords also appear as data vars
-                    try:
-                        return ds[name].values
-                    except Exception:
-                        pass
-            raise KeyError(
-                f"None of coord names {candidates} found in dataset: {list(ds.coords)}"
-            )
-
-        def _time_list(ds):
-            """
-            Return a Python list[datetime] for the dataset's time-like coordinate.
-            Tries common names and tolerates non-pandas indexes.
-            """
-            # prefer coords; fall back to dims-as-vars
-            tvals = _coord_values(ds, ("time", "valid_time", "t"))
-            # normalize to python datetimes
-            try:
-                import pandas as _pd
-
-                return [
-                    ts.to_pydatetime().replace(tzinfo=None)
-                    for ts in _pd.to_datetime(tvals)
-                ]
-            except Exception:
-                # final fallback via numpy
-                return [
-                    np.datetime64(x)
-                    .astype("datetime64[ms]")
-                    .astype(object)
-                    .replace(tzinfo=None)
-                    for x in tvals
-                ]
-
-        def _lat_vals(ds):
-            return _coord_values(ds, ("latitude", "lat", "y"))
-
-        def _lon_vals(ds):
-            return _coord_values(ds, ("longitude", "lon", "x"))
-
-        def _wrap_lon_for_coords(lon_coords, target_lon):
-            """
-            If dataset longitudes are 0..360 and target is -180..180, wrap target into same range.
-            """
-            lon_coords = np.asarray(lon_coords)
-            lo = float(target_lon)
-            if lon_coords.min() >= 0.0 and lon_coords.max() > 180.0:
-                # dataset uses 0..360
-                if lo < 0.0:
-                    lo = (lo + 360.0) % 360.0
-            else:
-                # dataset likely -180..180; also map 0..360 targets back if needed
-                if lo > 180.0:
-                    lo = ((lo + 180.0) % 360.0) - 180.0
-            return lo
-
-        # --- replacement: robust ERA5 nearest sampler --------------------------------
-        def nearest_truth(ds, var, grid, times):
-            lats = _lat_vals(ds)
-            lons = _lon_vals(ds)
-            tlist = _time_list(ds)  # python datetimes
-
-            T, G = len(times), len(grid)
-            out = np.empty((T, G), dtype=float)
-
-            # precompute for speed
-            lats = np.asarray(lats)
-            lons = np.asarray(lons)
-
-            for gi, (la, lo) in enumerate(grid):
-                # wrap longitude if grid uses -180..180 but dataset is 0..360 (or vice versa)
-                lo_adj = _wrap_lon_for_coords(lons, lo)
-                ilat = int(np.argmin(np.abs(lats - la)))
-                ilon = int(np.argmin(np.abs(lons - lo_adj)))
-                for ti, tt in enumerate(times):
-                    it = int(
-                        np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])
-                    )
-                    out[ti, gi] = float(
-                        ds[var].isel(latitude=ilat, longitude=ilon, time=it).values
-                    )
-            return out
-
-        def prefer_land(var):
-            return era5_land if var in era5_land.variables else era5_single
-
+        # --- ERA5 sampling with alias-resolved vars -----------------------------------
         try:
-            t2m_truth = to_celsius(
-                nearest_truth(prefer_land("t2m"), "t2m", grid, times)
-            )
-            td2m_truth = to_celsius(
-                nearest_truth(prefer_land("d2m"), "d2m", grid, times)
-            )
-            tp_truth = m_to_mm(nearest_truth(prefer_land("tp"), "tp", grid, times))
-            if "sp" in prefer_land("sp").variables:
-                sp_truth = pa_to_hpa(
-                    nearest_truth(prefer_land("sp"), "sp", grid, times)
-                )
-            else:
-                sp_truth = pa_to_hpa(nearest_truth(era5_single, "sp", grid, times))
-            u100 = nearest_truth(era5_single, "u100", grid, times)
-            v100 = nearest_truth(era5_single, "v100", grid, times)
+            # choose dataset by availability per variable
+            ds_t2m = _prefer_dataset_for("t2m")
+            ds_d2m = _prefer_dataset_for("d2m")
+            ds_tp = _prefer_dataset_for("tp")
+            ds_sp = _prefer_dataset_for("sp")
+            # u100/v100 only on ERA5 single
+            ds_u100 = _prefer_dataset_for("u100")
+            ds_v100 = _prefer_dataset_for("v100")
+
+            t2m_truth = to_celsius(nearest_truth(ds_t2m, "t2m", grid, times))
+            td2m_truth = to_celsius(nearest_truth(ds_d2m, "d2m", grid, times))
+            tp_truth = m_to_mm(nearest_truth(ds_tp, "tp", grid, times))
+            sp_truth = pa_to_hpa(nearest_truth(ds_sp, "sp", grid, times))
+            u100 = nearest_truth(ds_u100, "u100", grid, times)
+            v100 = nearest_truth(ds_v100, "v100", grid, times)
             wspd_truth = ms_to_kmh(np.hypot(u100, v100))
             wdir_truth = (np.degrees(np.arctan2(-u100, -v100)) + 360.0) % 360.0
         except Exception as e:
