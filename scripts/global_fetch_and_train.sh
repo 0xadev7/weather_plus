@@ -19,6 +19,8 @@
 #   ERA5_LAND_SCRIPT="scripts/fetch_era5_land.py"              # or era5_land_zip_aware.py
 set -euo pipefail
 
+export HDF5_USE_FILE_LOCKING=FALSE
+
 # -----------------------------
 # Config (env overridable)
 # -----------------------------

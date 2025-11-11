@@ -444,13 +444,21 @@ def fetch_days_in_month(
 
 
 def merge_parts(parts: List[str], outfile: str) -> bool:
+    """
+    Robust, batch-wise merge that avoids HDF5 locking stalls and slow graph builds.
+    - Opens files one-by-one (fast fail), logs progress.
+    - Merges in batches, then merges the batches.
+    - Uses override semantics to avoid attribute/coord conflicts.
+    """
     if not parts:
         return False
 
+    # Expand any leftover ZIPs first
     expanded: List[str] = []
     for p in parts:
         expanded.extend(_maybe_unzip_to_nc(p))
 
+    # Basic filter
     parts = sorted(
         {p for p in expanded if os.path.exists(p) and os.path.getsize(p) > 0}
     )
@@ -465,73 +473,163 @@ def merge_parts(parts: List[str], outfile: str) -> bool:
     if not parts:
         return False
 
-    try:
+    # Helper: open a dataset with tight, consistent options
+    def _open_clean(path: str):
         import xarray as xr
 
-        good_parts = []
-        still_bad = []
-        for p in parts:
-            opened = False
-            for eng in ("netcdf4", "h5netcdf", "scipy"):
-                try:
-                    xr.open_dataset(p, engine=eng).close()
-                    opened = True
-                    break
-                except Exception:
-                    continue
-            if opened:
-                good_parts.append(p)
-            else:
-                try:
-                    xr.open_dataset(p).close()
-                except Exception as e:
-                    still_bad.append((p, f"{e.__class__.__name__}: {e}"))
-                else:
-                    good_parts.append(p)
-
-        for p, emsg in still_bad:
-            log(f"warning: {p} unreadable by xarray ({emsg}); moved to .bad")
-            try:
-                shutil.move(p, p + ".bad")
-            except Exception:
-                pass
-
-        if not good_parts:
-            return False
-
-        log(f"merging {len(good_parts)} parts")
-        ds = None
-        last_err = None
-        write_engine = None
+        last = None
         for eng in ("netcdf4", "h5netcdf", "scipy"):
             try:
-                ds = xr.open_mfdataset(
-                    good_parts,
-                    combine="by_coords",
+                ds = xr.open_dataset(
+                    path,
                     engine=eng,
-                    parallel=False,
                     decode_times=True,
+                    chunks={},  # avoid dask auto-chunk across many files
+                    mask_and_scale=True,
+                    use_cftime=None,  # let xarray auto-choose
+                    cache=False,
                 )
-                write_engine = eng
-                break
+                # normalize coordinate names if needed (latitude/longitude expected already)
+                if "time" in ds:
+                    try:
+                        ds = ds.sortby("time")
+                        # drop duplicate times (keep first)
+                        _, idx = np.unique(ds["time"].values, return_index=True)
+                        if len(idx) != ds.sizes.get("time", len(idx)):
+                            ds = ds.isel(time=np.sort(idx))
+                    except Exception:
+                        pass
+                return ds, eng
             except Exception as e:
-                last_err = e
-                ds = None
-        if ds is None:
-            raise last_err  # type: ignore
+                last = e
+                continue
+        raise last if last else RuntimeError("failed to open dataset")
 
+    # Pre-open all, isolating bad files quickly and logging progress
+    good: List[Tuple[str, str]] = []  # (path, engine)
+    still_bad: List[Tuple[str, str]] = []
+    try:
+        import numpy as np  # used above for unique
+        import xarray as xr  # ensure present before loop
+    except Exception as e:
+        log(f"merge skipped (import error: {e})")
+        return False
+
+    for k, p in enumerate(parts, 1):
+        try:
+            ds, eng = _open_clean(p)
+            ds.close()  # we just probe here; reopen in batches below
+            good.append((p, eng))
+            if k % 25 == 0:
+                log(f"probe opened {k}/{len(parts)} parts OK")
+        except Exception as e:
+            still_bad.append((p, f"{e.__class__.__name__}: {e}"))
+
+    for p, emsg in still_bad:
+        log(f"warning: {p} unreadable; moved to .bad ({emsg})")
+        try:
+            shutil.move(p, p + ".bad")
+        except Exception:
+            pass
+
+    if not good:
+        return False
+
+    # Batch open-and-merge to keep memory and graphs manageable
+    BATCH = 20
+    batch_files = [good[i : i + BATCH] for i in range(0, len(good), BATCH)]
+    batch_paths: List[str] = []
+
+    import xarray as xr
+
+    for bi, items in enumerate(batch_files, 1):
+        opened = []
+        engines = set()
+        for p, eng in items:
+            ds, _ = _open_clean(p)
+            opened.append(ds)
+            engines.add(eng)
+        try:
+            log(f"merging batch {bi}/{len(batch_files)} with {len(opened)} parts")
+            bds = xr.combine_by_coords(
+                opened,
+                combine_attrs="override",
+                data_vars="minimal",
+                coords="minimal",
+                compat="override",
+                join="override",
+            )
+            if "time" in bds:
+                bds = bds.sortby("time")
+            tmp_path = outfile + f".batch_{bi:03d}.nc"
+            # pick a writer consistent with first engine in batch if possible
+            writer = (
+                "netcdf4"
+                if "netcdf4" in engines
+                else ("h5netcdf" if "h5netcdf" in engines else None)
+            )
+            if writer:
+                bds.to_netcdf(tmp_path, engine=writer)
+            else:
+                bds.to_netcdf(tmp_path)
+            bds.close()
+            for ds in opened:
+                ds.close()
+            batch_paths.append(tmp_path)
+        except Exception as e:
+            for ds in opened:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+            log(
+                f"warning: batch {bi} failed to merge ({e.__class__.__name__}: {e}); moving batch members to .bad"
+            )
+            for p, _ in items:
+                try:
+                    shutil.move(p, p + ".bad")
+                except Exception:
+                    pass
+
+    if not batch_paths:
+        return False
+
+    # Final merge of batch outputs (small number of files)
+    try:
+        opened = [
+            xr.open_dataset(b, decode_times=True, chunks={}, cache=False)
+            for b in batch_paths
+        ]
+        log(f"final merge of {len(opened)} batch files")
+        ds = xr.combine_by_coords(
+            opened,
+            combine_attrs="override",
+            data_vars="minimal",
+            coords="minimal",
+            compat="override",
+            join="override",
+        )
         if "time" in ds:
             ds = ds.sortby("time")
+
         tmp = outfile + ".tmp"
-        if write_engine in ("netcdf4", "h5netcdf"):
-            ds.to_netcdf(tmp, engine=write_engine)
-        else:
-            ds.to_netcdf(tmp)
+        ds.to_netcdf(tmp, engine="netcdf4")
         ds.close()
+        for od in opened:
+            try:
+                od.close()
+            except Exception:
+                pass
         os.replace(tmp, outfile)
+        # cleanup batch files
+        for b in batch_paths:
+            try:
+                os.remove(b)
+            except Exception:
+                pass
         return True
     except Exception as e:
-        log(f"merge skipped ({e.__class__.__name__}: {e})")
+        log(f"merge skipped at final stage ({e.__class__.__name__}: {e})")
         return False
 
 
