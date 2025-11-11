@@ -909,7 +909,6 @@ def main():
                             "hod": float(hods[ti]),
                             "lead": float(leads[ti]),
                             "baseline_om": bomv,
-                            "baseline_ifs": bifsv,
                             "baseline_diff": bomv
                             - (bifsv if np.isfinite(bifsv) else bomv),
                             "target": float(truth[ti, gi]),
