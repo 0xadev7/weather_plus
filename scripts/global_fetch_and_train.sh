@@ -200,6 +200,7 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
             --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
             --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
             --start \"$START\" --end \"$END\" \
+            --debug-merge --prune-parts \
             --outfile \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\"" \
           "logs/${TILE}_era5_single.log"
 
@@ -209,6 +210,7 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
             --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
             --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
             --start \"$START\" --end \"$END\" \
+            --debug-merge --prune-parts \
             --outfile \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\"" \
           "logs/${TILE}_era5_land.log"
       fi

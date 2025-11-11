@@ -51,80 +51,159 @@ def as_tg(arr, T, G):
 
 def _get_lat_lon_lists(j):
     """
-    Try many schema variants for grid lat/lon arrays.
-    Returns (lat_list, lon_list) or (None, None) if not found or invalid.
-    """
-    candidates = [
-        ("meta", "lat"),
-        ("meta", "lon"),
-        ("meta", "lats"),
-        ("meta", "lons"),
-        ("meta", "latitude"),
-        ("meta", "longitude"),
-        ("meta.grid", "lat"),
-        ("meta.grid", "lon"),
-        ("coords", "lat"),
-        ("coords", "lon"),
-        ("om", "latitude"),
-        ("om", "longitude"),
-        ("om.meta", "lat"),
-        ("om.meta", "lon"),
-        ("om.grid", "lat"),
-        ("om.grid", "lon"),
-    ]
+    Return (lat_list, lon_list) as floats, handling many schemas:
 
-    def dig(root, path):
+    1) meta.lat / meta.lon : [floats] or [objects]
+    2) meta.lats / meta.lons
+    3) meta.grid.lat / meta.grid.lon
+    4) coords.lat / coords.lon
+    5) om.latitude / om.longitude
+    6) om.meta.lat / om.meta.lon
+    7) om.grid.lat / om.grid.lon
+    8) A single list of points: *.grid.points = [{lat:.., lon:..}, ...] or *.points = [...]
+    9) A flat list of pairs: [[lat, lon], ...] or [{"lat":..,"lon":..}, ...]
+    """
+
+    def dig(root, dotted):
         cur = root
-        for key in path.split("."):
-            if not isinstance(cur, dict) or key not in cur:
+        for k in dotted.split("."):
+            if not isinstance(cur, dict) or k not in cur:
                 return None
-            cur = cur[key]
+            cur = cur[k]
         return cur
 
-    # We need a pair, so probe pairs in order
-    pairs = [
-        (("meta", "lat"), ("meta", "lon")),
-        (("meta", "lats"), ("meta", "lons")),
-        (("meta", "latitude"), ("meta", "longitude")),
-        (("meta.grid", "lat"), ("meta.grid", "lon")),
-        (("coords", "lat"), ("coords", "lon")),
-        (("om", "latitude"), ("om", "longitude")),
-        (("om.meta", "lat"), ("om.meta", "lon")),
-        (("om.grid", "lat"), ("om.grid", "lon")),
+    def _to_float_seq(seq, key_candidates=("lat", "latitude", "y", "value")):
+        """Coerce a heterogeneous list into a list[float]. Accept numbers, strings,
+        dicts with key_candidates, or 1-2 element lists/tuples."""
+        out = []
+        for x in seq:
+            if isinstance(x, (int, float)):
+                out.append(float(x))
+                continue
+            if isinstance(x, str):
+                try:
+                    out.append(float(x))
+                    continue
+                except:
+                    pass
+            if isinstance(x, dict):
+                got = None
+                for kk in key_candidates:
+                    if kk in x:
+                        vv = x[kk]
+                        if isinstance(vv, (int, float)):
+                            got = float(vv)
+                            break
+                        if isinstance(vv, str):
+                            try:
+                                got = float(vv)
+                                break
+                            except:
+                                pass
+                if got is not None:
+                    out.append(got)
+                    continue
+            if isinstance(x, (list, tuple)) and len(x) >= 1:
+                v = x[0]
+                if isinstance(v, (int, float)):
+                    out.append(float(v))
+                    continue
+                if isinstance(v, str):
+                    try:
+                        out.append(float(v))
+                        continue
+                    except:
+                        pass
+        return out if out else None
+
+    def _from_points(seq):
+        """seq like [{'lat':..,'lon':..}, ...] or [[lat, lon], ...] -> unique sorted lat[], lon[]."""
+        lats, lons = [], []
+        for p in seq:
+            la = lo = None
+            if isinstance(p, dict):
+                for k in ("lat", "latitude", "y"):
+                    if k in p:
+                        v = p[k]
+                        la = float(v) if isinstance(v, (int, float)) else float(str(v))
+                        break
+                for k in ("lon", "longitude", "x"):
+                    if k in p:
+                        v = p[k]
+                        lo = float(v) if isinstance(v, (int, float)) else float(str(v))
+                        break
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                try:
+                    la = float(p[0])
+                    lo = float(p[1])
+                except:
+                    pass
+            if la is not None and lo is not None:
+                lats.append(la)
+                lons.append(lo)
+        if lats and lons:
+            # dedupe while preserving order-ish
+            lat_u = sorted(set(round(v, 6) for v in lats))
+            lon_u = sorted(set(round(v, 6) for v in lons))
+            return [float(v) for v in lat_u], [float(v) for v in lon_u]
+        return None, None
+
+    # Candidate pairs of arrays (lat[], lon[])
+    array_pairs = [
+        ("meta.lat", "meta.lon"),
+        ("meta.lats", "meta.lons"),
+        ("meta.latitude", "meta.longitude"),
+        ("meta.grid.lat", "meta.grid.lon"),
+        ("coords.lat", "coords.lon"),
+        ("om.latitude", "om.longitude"),
+        ("om.meta.lat", "om.meta.lon"),
+        ("om.grid.lat", "om.grid.lon"),
     ]
+    for p_lat, p_lon in array_pairs:
+        lat_raw, lon_raw = dig(j, p_lat), dig(j, p_lon)
+        if (
+            lat_raw is not None
+            and lon_raw is not None
+            and isinstance(lat_raw, (list, tuple))
+            and isinstance(lon_raw, (list, tuple))
+        ):
+            lat = _to_float_seq(lat_raw)
+            lon = _to_float_seq(
+                lon_raw, key_candidates=("lon", "longitude", "x", "value")
+            )
+            if lat and lon:
+                return lat, lon
 
-    for (p_lat, k_lat), (p_lon, k_lon) in pairs:
-        lat = dig(j, p_lat)
-        if isinstance(lat, dict):  # e.g. {"lat":[...]}
-            lat = lat.get(k_lat)
-        elif p_lat.count("."):  # nested handled above
-            lat = dig(j, p_lat.split(".")[0])  # fallback noop
+    # Points-style schemas
+    point_candidates = [
+        "meta.grid.points",
+        "meta.points",
+        "om.grid.points",
+        "om.points",
+        "coords.points",
+    ]
+    for path in point_candidates:
+        seq = dig(j, path)
+        if isinstance(seq, (list, tuple)) and seq:
+            lat, lon = _from_points(seq)
+            if lat and lon:
+                return lat, lon
 
-        lat = dig(j, p_lat) if isinstance(lat, type(None)) else lat
-        if isinstance(lat, dict):
-            lat = lat.get(k_lat)
-
-        # Now lon
-        lon = dig(j, p_lon)
-        if isinstance(lon, dict):
-            lon = lon.get(k_lon)
-
-        # If we still don't have arrays, try direct keys
-        if lat is None:
-            lat = dig(j, p_lat + "." + k_lat)
-        if lon is None:
-            lon = dig(j, p_lon + "." + k_lon)
-
-        # Validate
-        if lat is not None and lon is not None:
-            # wrap scalars
-            if not isinstance(lat, (list, tuple, np.ndarray)):
-                lat = [lat]
-            if not isinstance(lon, (list, tuple, np.ndarray)):
-                lon = [lon]
-            lat = [float(x) for x in lat]
-            lon = [float(x) for x in lon]
-            if len(lat) >= 1 and len(lon) >= 1:
+    # Sometimes everything is under a top-level 'grid'
+    grid = j.get("grid")
+    if isinstance(grid, dict):
+        lat_raw, lon_raw = grid.get("lat"), grid.get("lon")
+        if isinstance(lat_raw, (list, tuple)) and isinstance(lon_raw, (list, tuple)):
+            lat = _to_float_seq(lat_raw)
+            lon = _to_float_seq(
+                lon_raw, key_candidates=("lon", "longitude", "x", "value")
+            )
+            if lat and lon:
+                return lat, lon
+        pts = grid.get("points")
+        if isinstance(pts, (list, tuple)):
+            lat, lon = _from_points(pts)
+            if lat and lon:
                 return lat, lon
 
     return None, None
@@ -168,6 +247,9 @@ def main():
         meta = j.get("meta", {})
         # First try declared helper
         lat, lon = _get_lat_lon_lists(j)
+        if lat is None or lon is None:
+            print(f"[pair] skip {os.path.basename(p)} (unable to parse lat/lon grid)")
+            continue
 
         if lat is None or lon is None:
             print(
