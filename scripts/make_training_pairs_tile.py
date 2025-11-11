@@ -626,17 +626,6 @@ def _has_var(ds, key):
         return False
 
 
-def _prefer_dataset_for(era5_land, era5_single, key):
-    if _has_var(era5_land, key):
-        log.debug(f"[choose-ds] {key}: ERA5-Land")
-        return era5_land
-    if _has_var(era5_single, key):
-        log.debug(f"[choose-ds] {key}: ERA5 Single-levels")
-        return era5_single
-    log.debug(f"[choose-ds] {key}: not found; default ERA5 Single-levels")
-    return era5_single
-
-
 def _dims_for(da: xr.DataArray):
     lat_dim = next((d for d in ("latitude", "lat", "y") if d in da.dims), None)
     lon_dim = next((d for d in ("longitude", "lon", "x") if d in da.dims), None)
@@ -647,8 +636,17 @@ def _dims_for(da: xr.DataArray):
 
 
 def _index_nearest(vals: np.ndarray, target: float) -> int:
-    # vals may be ascending or descending; works either way
     return int(np.nanargmin(np.abs(np.asarray(vals, dtype=float) - float(target))))
+
+
+def _map_target_lon_for_coords(lon_coords: np.ndarray, lo_req: float) -> float:
+    # map request into dataset's lon frame (0–360 or −180..180); treat +180 == −180
+    lon_coords = np.asarray(lon_coords, dtype=float)
+    if np.nanmin(lon_coords) >= 0.0 and np.nanmax(lon_coords) > 180.0:
+        x = (float(lo_req) + 360.0) % 360.0
+        return 0.0 if abs(x - 360.0) < 1e-9 else x
+    x = ((float(lo_req) + 180.0) % 360.0) - 180.0
+    return -180.0 if abs(x - 180.0) < 1e-9 else x
 
 
 def nearest_truth(ds, key, grid, times):
@@ -660,51 +658,57 @@ def nearest_truth(ds, key, grid, times):
     lons = _coord_values(ds, ("longitude", "lon", "x"))
     tlist = _time_list(ds)
 
-    # Precompute time mapping once (nearest to requested axis)
+    # precompute nearest time indices
     t_idx = [
         int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])) for tt in times
     ]
     T, G = len(times), len(grid)
     out = np.empty((T, G), dtype=float)
 
-    # For speed, convert to numpy arrays once
     lats = np.asarray(lats, dtype=float)
     lons = np.asarray(lons, dtype=float)
 
-    # Determine if lon coord uses 0–360 or -180–180 and map targets accordingly
-    def _map_target_lon(lo_req):
-        # If lon coord is all >=0 and extends beyond 180, treat as 0–360
-        if np.nanmin(lons) >= 0.0 and np.nanmax(lons) > 180.0:
-            # map request into 0–360 canonical
-            x = (float(lo_req) + 360.0) % 360.0
-            # treat +360 == 0
-            return 0.0 if abs(x - 360.0) < 1e-9 else x
-        # else treat as -180..180
-        x = ((float(lo_req) + 180.0) % 360.0) - 180.0
-        # make +180 behave like -180
-        return -180.0 if abs(x - 180.0) < 1e-9 else x
-
-    # Build outputs by nearest-neighbour on model grid with pole rule
-    # (ignore longitude when |lat| >= 89.5°)
     for gi, (la_req, lo_req) in enumerate(grid):
         la_req = float(la_req)
         if abs(la_req) >= 89.5:
             ilat = _index_nearest(lats, la_req)
-            # longitude irrelevant at pole; pick first column for speed
-            ilon = 0
+            ilon = 0  # longitude irrelevant at the pole
         else:
             ilat = _index_nearest(lats, la_req)
-            lo_adj = _map_target_lon(lo_req)
-            # distance in degrees with cos(lat) weighting across the whole lon axis
-            # (use nearest in 1D since lons are uniform enough once mapped)
+            lo_adj = _map_target_lon_for_coords(lons, lo_req)
             ilon = _index_nearest(lons, lo_adj)
 
-        # slice all requested times at once
         out[:, gi] = da.isel(
             {lat_dim: ilat, lon_dim: ilon, time_dim: xr.DataArray(t_idx)}
         ).values
-
     return out
+
+
+def hybrid_truth(era5_land: xr.Dataset, era5_single: xr.Dataset, key: str, grid, times):
+    """Use ERA5-Land where finite; fall back to Single-levels elsewhere."""
+    # Some vars (u100/v100) exist only in single — handle that quickly
+    try_land = _has_var(era5_land, key)
+    try_single = _has_var(era5_single, key)
+
+    if not try_single and not try_land:
+        raise KeyError(f"No dataset provides variable '{key}'")
+
+    # sample what we can from each
+    land_arr = None
+    if try_land:
+        land_arr = nearest_truth(era5_land, key, grid, times)
+
+    single_arr = None
+    if try_single:
+        single_arr = nearest_truth(era5_single, key, grid, times)
+
+    if land_arr is None:
+        return single_arr
+    if single_arr is None:
+        return land_arr
+
+    land_ok = np.isfinite(land_arr)
+    return np.where(land_ok, land_arr, single_arr)
 
 
 # -------------------------
@@ -891,19 +895,21 @@ def main():
 
         # ERA5 truth sampling on requested grid/time
         try:
-            ds_t2m = _prefer_dataset_for(era5_land, era5_single, "t2m")
-            ds_d2m = _prefer_dataset_for(era5_land, era5_single, "d2m")
-            ds_tp = _prefer_dataset_for(era5_land, era5_single, "tp")
-            ds_sp = _prefer_dataset_for(era5_land, era5_single, "sp")
-            ds_u100 = _prefer_dataset_for(era5_land, era5_single, "u100")
-            ds_v100 = _prefer_dataset_for(era5_land, era5_single, "v100")
+            # Use hybrid for global coverage (ocean + land)
+            t2m_truth = to_celsius(
+                hybrid_truth(era5_land, era5_single, "t2m", grid, times)
+            )
+            td2m_truth = to_celsius(
+                hybrid_truth(era5_land, era5_single, "d2m", grid, times)
+            )
+            tp_truth = m_to_mm(hybrid_truth(era5_land, era5_single, "tp", grid, times))
+            sp_truth = pa_to_hpa(
+                hybrid_truth(era5_land, era5_single, "sp", grid, times)
+            )
 
-            t2m_truth = to_celsius(nearest_truth(ds_t2m, "t2m", grid, times))
-            td2m_truth = to_celsius(nearest_truth(ds_d2m, "d2m", grid, times))
-            tp_truth = m_to_mm(nearest_truth(ds_tp, "tp", grid, times))
-            sp_truth = pa_to_hpa(nearest_truth(ds_sp, "sp", grid, times))
-            u100 = nearest_truth(ds_u100, "u100", grid, times)
-            v100 = nearest_truth(ds_v100, "v100", grid, times)
+            # 100 m winds: come from single-levels
+            u100 = nearest_truth(era5_single, "u100", grid, times)
+            v100 = nearest_truth(era5_single, "v100", grid, times)
             wspd_truth = ms_to_kmh(np.hypot(u100, v100))
             wdir_truth = (np.degrees(np.arctan2(-u100, -v100)) + 360.0) % 360.0
         except Exception as e:
