@@ -432,19 +432,37 @@ def main():
 
         # Pull hourly block(s)
         om = _safe_get(j, "om", "hourly", default=None)
-        if om is None or "time" not in om:
-            print(f"[pair] skip {os.path.basename(p)} (missing om.hourly.time)")
-            continue
         ifs = _safe_get(j, "ifs", "hourly", default=None)
 
         # Times
-        try:
-            times = [dt.datetime.fromisoformat(t.replace("Z", "")) for t in om["time"]]
-        except Exception as e:
-            print(f"[pair] skip {os.path.basename(p)} (bad time array: {e})")
-            continue
+        times = None
+        if om is not None and "time" in om:
+            try:
+                times = [
+                    dt.datetime.fromisoformat(t.replace("Z", "")) for t in om["time"]
+                ]
+            except Exception as e:
+                print(f"[pair] skip {os.path.basename(p)} (bad time array: {e})")
+                continue
+        else:
+            # Fallback: meta.start/meta.end hourly range
+            m = j.get("meta", {}) or {}
+            try:
+                t0 = dt.datetime.fromisoformat(m["start"])
+                t1 = dt.datetime.fromisoformat(m["end"])
+                # inclusive of start, exclusive of end; hourly steps
+                times = [
+                    t0 + dt.timedelta(hours=h)
+                    for h in range(int((t1 - t0).total_seconds() // 3600))
+                ]
+            except Exception:
+                print(f"[pair] skip {os.path.basename(p)} (missing om.hourly.time)")
+                continue
 
-        grid = flatten_grid(lat, lon)
+        grid = _extract_grid_points(j)
+        if not grid:
+            print(f"[pair] skip {os.path.basename(p)} (unable to parse lat/lon grid)")
+            continue
         T, G = len(times), len(grid)
         if T == 0 or G == 0:
             print(f"[pair] skip {os.path.basename(p)} (empty times or grid)")
@@ -569,6 +587,57 @@ def main():
             print(
                 f"[pair] warning: empty dataframe for {outname} on {args.tile_id} (no matching OM files / coords?)"
             )
+
+
+def _extract_grid_points(j):
+    """
+    Returns list[(lat, lon)] in the *exact* order baselines are flattened.
+
+    Priority:
+      1) meta.paired_lat / meta.paired_lon  -> zipped pairs (batch subsets)
+      2) Explicit arrays (via _get_lat_lon_lists) -> Cartesian product (flatten_grid)
+      3) meta.lat_axis / meta.lon_axis -> Cartesian product (full axes)
+    """
+    meta = j.get("meta", {}) or {}
+
+    # 1) Paired (batched) coordinates — keep order exactly as given
+    p_lat = meta.get("paired_lat")
+    p_lon = meta.get("paired_lon")
+    if (
+        isinstance(p_lat, list)
+        and isinstance(p_lon, list)
+        and len(p_lat) == len(p_lon)
+        and len(p_lat) > 0
+    ):
+        try:
+            glist = [(float(la), float(lo)) for la, lo in zip(p_lat, p_lon)]
+            return glist
+        except Exception:
+            pass  # fall through if any bad values
+
+    # 2) Try any of the many array schemas you already support
+    lat, lon = _get_lat_lon_lists(j)
+    if lat and lon:
+        return flatten_grid(lat, lon)
+
+    # 3) Axes (full grid) — Open-Meteo often uses these
+    lat_axis = meta.get("lat_axis")
+    lon_axis = meta.get("lon_axis")
+    if (
+        isinstance(lat_axis, list)
+        and isinstance(lon_axis, list)
+        and lat_axis
+        and lon_axis
+    ):
+        try:
+            lat = [float(x) for x in lat_axis]
+            lon = [float(x) for x in lon_axis]
+            return flatten_grid(lat, lon)
+        except Exception:
+            pass
+
+    # Nothing found
+    return None
 
 
 if __name__ == "__main__":
