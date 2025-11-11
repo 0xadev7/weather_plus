@@ -618,26 +618,6 @@ def _time_list(ds):
         ]
 
 
-def _lat_vals(ds):
-    return _coord_values(ds, ("latitude", "lat", "y"))
-
-
-def _lon_vals(ds):
-    return _coord_values(ds, ("longitude", "lon", "x"))
-
-
-def _wrap_lon_for_coords(lon_coords, target_lon):
-    lon_coords = np.asarray(lon_coords)
-    lo = float(target_lon)
-    if lon_coords.min() >= 0.0 and lon_coords.max() > 180.0:
-        if lo < 0.0:
-            lo = (lo + 360.0) % 360.0
-    else:
-        if lo > 180.0:
-            lo = ((lo + 180.0) % 360.0) - 180.0
-    return lo
-
-
 def _has_var(ds, key):
     try:
         _find_var_name(ds, key)
@@ -657,30 +637,73 @@ def _prefer_dataset_for(era5_land, era5_single, key):
     return era5_single
 
 
+def _dims_for(da: xr.DataArray):
+    lat_dim = next((d for d in ("latitude", "lat", "y") if d in da.dims), None)
+    lon_dim = next((d for d in ("longitude", "lon", "x") if d in da.dims), None)
+    time_dim = next((d for d in ("time", "valid_time", "t") if d in da.dims), None)
+    if not lat_dim or not lon_dim or not time_dim:
+        raise KeyError(f"Could not resolve dims for dataarray; dims={da.dims}")
+    return lat_dim, lon_dim, time_dim
+
+
+def _index_nearest(vals: np.ndarray, target: float) -> int:
+    # vals may be ascending or descending; works either way
+    return int(np.nanargmin(np.abs(np.asarray(vals, dtype=float) - float(target))))
+
+
 def nearest_truth(ds, key, grid, times):
     vname = _find_var_name(ds, key)
     da = _maybe_squeeze_members(ds[vname])
+    lat_dim, lon_dim, time_dim = _dims_for(da)
 
-    lats = _lat_vals(ds)
-    lons = _lon_vals(ds)
+    lats = _coord_values(ds, ("latitude", "lat", "y"))
+    lons = _coord_values(ds, ("longitude", "lon", "x"))
     tlist = _time_list(ds)
+
+    # Precompute time mapping once (nearest to requested axis)
+    t_idx = [
+        int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])) for tt in times
+    ]
     T, G = len(times), len(grid)
     out = np.empty((T, G), dtype=float)
-    lats = np.asarray(lats)
-    lons = np.asarray(lons)
 
-    # Precompute time index map to requested times
-    t_idx = []
-    for tt in times:
-        t_idx.append(int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])))
+    # For speed, convert to numpy arrays once
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
 
-    for gi, (la, lo) in enumerate(grid):
-        lo_adj = _wrap_lon_for_coords(lons, lo)
-        ilat = int(np.argmin(np.abs(lats - la)))
-        ilon = int(np.argmin(np.abs(lons - lo_adj)))
+    # Determine if lon coord uses 0–360 or -180–180 and map targets accordingly
+    def _map_target_lon(lo_req):
+        # If lon coord is all >=0 and extends beyond 180, treat as 0–360
+        if np.nanmin(lons) >= 0.0 and np.nanmax(lons) > 180.0:
+            # map request into 0–360 canonical
+            x = (float(lo_req) + 360.0) % 360.0
+            # treat +360 == 0
+            return 0.0 if abs(x - 360.0) < 1e-9 else x
+        # else treat as -180..180
+        x = ((float(lo_req) + 180.0) % 360.0) - 180.0
+        # make +180 behave like -180
+        return -180.0 if abs(x - 180.0) < 1e-9 else x
+
+    # Build outputs by nearest-neighbour on model grid with pole rule
+    # (ignore longitude when |lat| >= 89.5°)
+    for gi, (la_req, lo_req) in enumerate(grid):
+        la_req = float(la_req)
+        if abs(la_req) >= 89.5:
+            ilat = _index_nearest(lats, la_req)
+            # longitude irrelevant at pole; pick first column for speed
+            ilon = 0
+        else:
+            ilat = _index_nearest(lats, la_req)
+            lo_adj = _map_target_lon(lo_req)
+            # distance in degrees with cos(lat) weighting across the whole lon axis
+            # (use nearest in 1D since lons are uniform enough once mapped)
+            ilon = _index_nearest(lons, lo_adj)
+
+        # slice all requested times at once
         out[:, gi] = da.isel(
-            latitude=ilat, longitude=ilon, time=xr.DataArray(t_idx)
+            {lat_dim: ilat, lon_dim: ilon, time_dim: xr.DataArray(t_idx)}
         ).values
+
     return out
 
 
@@ -694,12 +717,6 @@ def safe_to_parquet(
 
     def _write(df_final: pd.DataFrame):
         engines = []
-        try:
-            import pyarrow  # noqa: F401
-
-            engines.append(("pyarrow", {}))
-        except Exception:
-            pass
         try:
             import fastparquet  # noqa: F401
 
@@ -880,13 +897,6 @@ def main():
             ds_sp = _prefer_dataset_for(era5_land, era5_single, "sp")
             ds_u100 = _prefer_dataset_for(era5_land, era5_single, "u100")
             ds_v100 = _prefer_dataset_for(era5_land, era5_single, "v100")
-            
-            with pd.option_context('display.max_rows', None,
-                       'display.max_columns', None,
-                       'display.width', None,
-                       'display.max_colwidth', None):
-                print(ds_t2m.head(1000))
-                print(ds_d2m.head(1000))
 
             t2m_truth = to_celsius(nearest_truth(ds_t2m, "t2m", grid, times))
             td2m_truth = to_celsius(nearest_truth(ds_d2m, "d2m", grid, times))
