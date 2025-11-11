@@ -371,7 +371,7 @@ def _extract_grid_points(j):
 
 
 # -------------------------
-# Baseline parsing
+# Baseline parsing (snap requested grid to nearest available OM/IFS points)
 # -------------------------
 def _parse_times_from_hourly_block(block):
     if not isinstance(block, dict) or "time" not in block:
@@ -383,6 +383,17 @@ def _parse_times_from_hourly_block(block):
 
 
 def _extract_times(j):
+    # prefer meta start/end (request-based), fall back to first OM item
+    m = j.get("meta", {}) or {}
+    try:
+        t0 = dt.datetime.fromisoformat(m["start"])
+        t1 = dt.datetime.fromisoformat(m["end"])
+        return [
+            t0 + dt.timedelta(hours=h)
+            for h in range(int((t1 - t0).total_seconds() // 3600))
+        ]
+    except Exception:
+        pass
     om = j.get("om")
     if isinstance(om, dict) and "hourly" in om:
         t = _parse_times_from_hourly_block(om["hourly"])
@@ -393,25 +404,37 @@ def _extract_times(j):
         t = _parse_times_from_hourly_block(hb)
         if t:
             return t
-    m = j.get("meta", {}) or {}
-    try:
-        t0 = dt.datetime.fromisoformat(m["start"])
-        t1 = dt.datetime.fromisoformat(m["end"])
-        return [
-            t0 + dt.timedelta(hours=h)
-            for h in range(int((t1 - t0).total_seconds() // 3600))
-        ]
-    except Exception:
-        return None
+    return None
 
 
-def _build_matrix_from_points(point_list, name, times, grid):
+def _lon_diff_deg(a, b):
+    """Shortest signed lon difference in degrees (wrapping at 180)."""
+    d = (a - b + 540.0) % 360.0 - 180.0
+    return d
+
+
+def _nearest_idx_points(points_lat, points_lon, req_lat, req_lon):
+    """Return index of nearest point by great-circle-aware degree metric."""
+    # weight longitude by cos(lat) to approximate distance in degrees
+    lat_arr = np.asarray(points_lat, dtype=float)
+    lon_arr = np.asarray(points_lon, dtype=float)
+
+    dlat = lat_arr - float(req_lat)
+    dlon = np.array([_lon_diff_deg(l, req_lon) for l in lon_arr], dtype=float)
+    w = np.cos(np.deg2rad(float(req_lat)))
+    dist2 = dlat * dlat + (w * dlon) * (w * dlon)
+    return int(np.argmin(dist2)), float(np.min(dist2))
+
+
+def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.45):
+    """
+    Build (T,G) array on requested grid by snapping each requested (lat,lon)
+    to the nearest available returned point (lat',lon') within tol_deg.
+    """
     T, G = len(times), len(grid)
 
-    def _r(x):
-        return round(float(x), 6)
-
-    series_map = {}
+    # Collect available coordinates and series
+    pts_lat, pts_lon, series_per_point, times_per_point = [], [], [], []
     for p in point_list:
         la = p.get("latitude")
         lo = p.get("longitude")
@@ -420,33 +443,42 @@ def _build_matrix_from_points(point_list, name, times, grid):
         if la is None or lo is None or vals is None:
             continue
         v = np.asarray(vals, dtype=float)
-        if v.size != T:
-            p_times = _parse_times_from_hourly_block(hb)
-            if p_times and len(p_times) == v.size:
-                aligned = np.empty(T, dtype=float)
-                for i, tt in enumerate(times):
-                    j = int(
-                        np.argmin([abs((tt - pt).total_seconds()) for pt in p_times])
-                    )
-                    aligned[i] = float(v[j])
-                v = aligned
-            else:
-                raise RuntimeError(
-                    f"point ({la},{lo}) var {name} length {v.size} != T={T}"
-                )
-        series_map[(_r(la), _r(lo))] = v
+        p_times = _parse_times_from_hourly_block(hb)
+        # Time-align if needed
+        if p_times and len(p_times) == v.size and v.size != T:
+            aligned = np.empty(T, dtype=float)
+            for i, tt in enumerate(times):
+                j = int(np.argmin([abs((tt - pt).total_seconds()) for pt in p_times]))
+                aligned[i] = float(v[j])
+            v = aligned
+        elif v.size != T:
+            # If sizes mismatch and no usable time list, skip this point
+            continue
 
+        pts_lat.append(float(la))
+        pts_lon.append(float(lo))
+        series_per_point.append(v.astype(float))
+        times_per_point.append(True)  # marker
+
+    if not series_per_point:
+        raise KeyError(f"no points carried var {name}")
+
+    # Build out matrix by nearest-neighbour snap per requested grid point
     out = np.empty((T, G), dtype=float)
-    missing = 0
-    for gi, (la, lo) in enumerate(grid):
-        key = (_r(la), _r(lo))
-        if key not in series_map:
-            missing += 1
-            out[:, gi] = np.nan
-        else:
-            out[:, gi] = series_map[key]
-    if missing and missing == G:
-        raise KeyError(f"no points matched grid for var {name}")
+    out[:] = np.nan
+    # absolute tolerance in degrees ~0.45 (~50 km at mid-lats for IFS/GFS grids)
+    tol2 = tol_deg**2
+
+    for gi, (la_req, lo_req) in enumerate(grid):
+        idx, d2 = _nearest_idx_points(pts_lat, pts_lon, la_req, lo_req)
+        if d2 > tol2:
+            # leave as NaN; will be handled by caller
+            continue
+        out[:, gi] = series_per_point[idx]
+
+    # If everything missing, signal to caller
+    if np.all(~np.isfinite(out)):
+        raise KeyError(f"no points matched requested grid for var {name}")
     return out
 
 
@@ -455,6 +487,8 @@ def _parse_baseline(j, key, times, grid, required_vars):
     if blk is None:
         return {v: None for v in required_vars}
     T, G = len(times), len(grid)
+
+    # Case A: block is a dict with "hourly" already (rare in your dumps)
     if isinstance(blk, dict) and "hourly" in blk:
         hourly = blk["hourly"] or {}
         out = {}
@@ -466,6 +500,8 @@ def _parse_baseline(j, key, times, grid, required_vars):
             if out[v] is not None and out[v].shape == (T, 1) and G > 1:
                 out[v] = np.repeat(out[v], G, axis=1)
         return out
+
+    # Case B: list of point objects (typical OM/IFS baseline you saved)
     if isinstance(blk, list):
         out = {}
         for v in required_vars:
@@ -474,6 +510,7 @@ def _parse_baseline(j, key, times, grid, required_vars):
             except KeyError:
                 out[v] = None
         return out
+
     return {v: None for v in required_vars}
 
 
@@ -607,13 +644,18 @@ def nearest_truth(ds, key, grid, times):
     lats = np.asarray(lats)
     lons = np.asarray(lons)
 
+    # Precompute time index map to requested times
+    t_idx = []
+    for tt in times:
+        t_idx.append(int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])))
+
     for gi, (la, lo) in enumerate(grid):
         lo_adj = _wrap_lon_for_coords(lons, lo)
         ilat = int(np.argmin(np.abs(lats - la)))
         ilon = int(np.argmin(np.abs(lons - lo_adj)))
-        for ti, tt in enumerate(times):
-            it = int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist]))
-            out[ti, gi] = float(da.isel(latitude=ilat, longitude=ilon, time=it).values)
+        out[:, gi] = da.isel(
+            latitude=ilat, longitude=ilon, time=xr.DataArray(t_idx)
+        ).values
     return out
 
 
@@ -671,7 +713,6 @@ def safe_to_parquet(
             log.warning(
                 f"[parquet] append failed to read existing {path}: {e!r}; rewriting fresh"
             )
-            # Fall through to fresh write
     _write(df)
 
 
@@ -696,9 +737,6 @@ def main():
     era5_single = xr.open_dataset(args.era5_single)
     log.info(f"Loading ERA5-Land:  {args.era5_land}")
     era5_land = xr.open_dataset(args.era5_land)
-
-    print(era5_single.head(20))
-    print(era5_land.head(20))
 
     rows = {k: [] for k in ["t2m", "td2m", "psfc", "tp", "wspd100", "wdir100"]}
 
@@ -747,8 +785,6 @@ def main():
             continue
 
         log.info(f"[pair] {base}: T={T}, G={G}")
-        print("TIMES: \n", times, "\n")
-        print("GRID: \n", grid, "\n")
 
         t0 = times[0]
         leads = np.array(
@@ -758,8 +794,6 @@ def main():
 
         om_vars = _parse_baseline(j, "om", times, grid, needed)
         ifs_vars = _parse_baseline(j, "ifs", times, grid, needed)
-        
-        print(om_vars, ifs_vars)
 
         missing_keys = [k for k in needed if om_vars.get(k) is None]
         if missing_keys:
@@ -782,7 +816,7 @@ def main():
 
         def _ensure_TG(a):
             a = np.asarray(a)
-            if a.shape == (T,):
+            if a.ndim == 1:
                 a = a[:, None]
             if a.shape == (T, 1) and G > 1:
                 a = np.repeat(a, G, axis=1)
@@ -813,12 +847,13 @@ def main():
             log.warning(f"[pair] skip {base} (shape issue: {e})")
             continue
 
+        # ERA5 truth sampling on requested grid/time
         try:
             ds_t2m = _prefer_dataset_for(era5_land, era5_single, "t2m")
             ds_d2m = _prefer_dataset_for(era5_land, era5_single, "d2m")
             ds_tp = _prefer_dataset_for(era5_land, era5_single, "tp")
             ds_sp = _prefer_dataset_for(era5_land, era5_single, "sp")
-            ds_u100 = _prefer_dataset_for(era5_land, era5_single, "u100")  # single
+            ds_u100 = _prefer_dataset_for(era5_land, era5_single, "u100")
             ds_v100 = _prefer_dataset_for(era5_land, era5_single, "v100")
 
             t2m_truth = to_celsius(nearest_truth(ds_t2m, "t2m", grid, times))
@@ -880,13 +915,11 @@ def main():
         df = pd.DataFrame(rows[key])
         out_path = os.path.join(OUT_DIR, f"{args.tile_id}__{outname}.parquet")
         if not df.empty:
-            # append into existing, drop duplicates
             safe_to_parquet(df, out_path, append=True, subset=uniq_key)
             log.info(f"saved {args.tile_id} {outname} -> {out_path} (append+dedupe)")
         else:
             log.info(f"[pair] no new rows for {outname} on {args.tile_id}")
 
-    # Update manifest last, only if we actually wrote rows from those files
     _append_processed(args.tile_id, new_processed)
     if new_processed:
         log.info(
