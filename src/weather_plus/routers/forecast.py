@@ -14,7 +14,7 @@ from weather_plus.engine.features import (
 
 router = APIRouter()
 MC = ModelCache(
-    model_dir=__import__("server.config", fromlist=[""]).MODEL_DIR
+    model_dir=__import__("src.weather_plus.config", fromlist=[""]).MODEL_DIR
 )  # lazy import cfg
 
 
