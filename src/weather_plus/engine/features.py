@@ -213,17 +213,40 @@ def assemble_X(
             coll["t2m_grad3"] = t2 - _shift(t2, 3)
 
     # - Skin temperature, snow depth (pass-through if present)
-    if "skin_temperature" in base_om:
-        coll["skin_temp"] = _safe(base_om["skin_temperature"])
+    if "soil_temperature_0cm" in base_om:
+        coll["skin_temp"] = _safe(base_om["soil_temperature_0cm"])
     if "snow_depth" in base_om:
         coll["snow_depth"] = _safe(base_om["snow_depth"])
 
-    # - Soil water volumetric layers -> swvl1..4
-    for n in (1, 2, 3, 4):
-        key = f"swvl{n}"
-        src = f"volumetric_soil_water_layer_{n}"
-        if src in base_om:
-            coll[key] = _safe(base_om[src])
+    t = {
+        "0_1": 1,
+        "1_3": 2,
+        "3_9": 6,
+        "9_27": 18,
+        "27_81": 54,
+    }
+    sm = {
+        "0_1": coll["soil_moisture_0_to_1cm"],
+        "1_3": coll["soil_moisture_1_to_3cm"],
+        "3_9": coll["soil_moisture_3_to_9cm"],
+        "9_27": coll["soil_moisture_9_to_27cm"],
+        "27_81": coll["soil_moisture_27_to_81cm"],
+    }
+
+    # Approximate ERA5 layers:
+    coll["swvl1"] = (
+        t["0_1"] * sm["0_1"] + t["1_3"] * sm["1_3"] + t["3_9"] * sm["3_9"]
+    ) / (
+        t["0_1"] + t["1_3"] + t["3_9"]
+    )  # 0–7 cm ~ 0–9 cm
+    coll["swvl2"] = (t["9_27"] * sm["9_27"] + (7 / 54) * t["27_81"] * sm["27_81"]) / (
+        t["9_27"] + (7 / 54) * t["27_81"]
+    )  # ~7–28 cm
+    coll["swvl3"] = ((21 / 54) * t["27_81"] * sm["27_81"]) / (
+        (21 / 54) * t["27_81"]
+    )  # ~28–100 cm (coarse)
+    # swvl4 (100–289 cm) not covered by OM’s 27–81 cm; omit unless you add a model with deeper soil.
+    coll["swvl4"] = np.full(T, np.nan, dtype=float)
 
     # - Lag features of the *target variable's* baseline_om
     #   (lag1, lag3, lag6, lag24). Only compute when requested.

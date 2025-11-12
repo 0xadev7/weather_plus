@@ -13,11 +13,12 @@ SUPPORTED = {
     "precipitation": "precipitation",
     "wind_speed_100m": "wind_speed_100m",
     "wind_direction_100m": "wind_direction_100m",
-    "skin_temperature": "skin_temperature",
     "snow_depth": "snow_depth",
-    "volumetric_soil_water_layer_1": "volumetric_soil_water_layer_1",
-    "volumetric_soil_water_layer_2": "volumetric_soil_water_layer_2",
-    "volumetric_soil_water_layer_3": "volumetric_soil_water_layer_3",
-    "volumetric_soil_water_layer_4": "volumetric_soil_water_layer_4",
+    "soil_temperature_0cm": "soil_temperature_0cm",
+    "soil_moisture_0_to_1cm": "soil_moisture_0_to_1cm",
+    "soil_moisture_1_to_3cm": "soil_moisture_1_to_3cm",
+    "soil_moisture_3_to_9cm": "soil_moisture_3_to_9cm",
+    "soil_moisture_9_to_27cm": "soil_moisture_9_to_27cm",
+    "soil_moisture_27_to_81cm": "soil_moisture_27_to_81cm",
 }
 BASELINE_NEEDED = ",".join(SUPPORTED.keys())
