@@ -299,6 +299,8 @@ def assemble_X(
             raise HTTPException(500, f"Server cannot build feature '{name}'.")
         Xcols.append(name)
         data_cols.append(coll[name])
+        
+    print(Xcols, data_cols)
 
     X = np.column_stack(data_cols) if Xcols else np.zeros((T, 0), dtype=float)
     return X, Xcols
