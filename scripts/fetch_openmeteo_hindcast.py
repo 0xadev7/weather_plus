@@ -108,6 +108,8 @@ def get_om(
         "end_hour": end_hour,
         "timezone": "UTC",
         "timeformat": "iso8601",
+        "cell_selection": "nearest",
+        "elevation": "nan",
     }
     if models:
         params["models"] = models

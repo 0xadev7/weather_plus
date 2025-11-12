@@ -2,15 +2,16 @@
 import os, json, glob, argparse, datetime as dt, logging, warnings
 import numpy as np, pandas as pd, xarray as xr
 
+# I/O layout (unchanged)
 OM_DIR = os.path.join("data", "om_baseline")
 OUT_DIR = os.path.join("data", "train_tiles")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-log = logging.getLogger("make_pairs")
+log = logging.getLogger("make_pairs_plus")
 
 
 # -------------------------
-# Utilities
+# Logging / small utils
 # -------------------------
 def setup_logging(level: str):
     lvl = getattr(logging, level.upper(), logging.INFO)
@@ -19,7 +20,6 @@ def setup_logging(level: str):
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # xarray / numexpr can be noisy
     warnings.filterwarnings("ignore", message=".*lazy array.*")
     warnings.filterwarnings("ignore", message="Mean of empty slice.*")
 
@@ -58,7 +58,7 @@ def as_tg(arr, T, G):
 
 
 # -------------------------
-# Manifest (processed OM files per tile)
+# Manifest (already-processed OM files per tile)
 # -------------------------
 def _manifest_path(tile_id: str) -> str:
     return os.path.join(OUT_DIR, f"{tile_id}__processed_om.txt")
@@ -86,7 +86,7 @@ def _append_processed(tile_id: str, basenames: list[str]) -> None:
 
 
 # -------------------------
-# Robust lat/lon parsing
+# Robust lat/lon parsing (unchanged API, extended paths)
 # -------------------------
 def _get_lat_lon_lists(j):
     def dig(root, dotted):
@@ -107,7 +107,7 @@ def _get_lat_lon_lists(j):
     def _ensure_sorted_unique(vals):
         return [float(v) for v in sorted(set(round(float(v), 7) for v in vals))]
 
-    def _from_descriptor(desc, axis="lat"):
+    def _from_descriptor(desc):
         if not isinstance(desc, dict):
             return None
         if "values" in desc and isinstance(desc["values"], (list, tuple)):
@@ -168,7 +168,7 @@ def _get_lat_lon_lists(j):
                         float(bb["lon_max"]),
                     )
             elif isinstance(bb, (list, tuple)) and len(bb) == 4:
-                return (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
+                return float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
             return None
 
         parsed = _parse_bbox(bbox)
@@ -192,10 +192,9 @@ def _get_lat_lon_lists(j):
             nx = ny = None
         if not nx or not ny:
             return None, None
-
-        lat_list = list(np.linspace(lat_min, lat_max, ny))
-        lon_list = list(np.linspace(lon_min, lon_max, nx))
-        return lat_list, lon_list
+        return list(np.linspace(lat_min, lat_max, ny)), list(
+            np.linspace(lon_min, lon_max, nx)
+        )
 
     def _to_float_seq(seq, key_candidates=("lat", "latitude", "y", "value")):
         out = []
@@ -334,7 +333,6 @@ def _get_lat_lon_lists(j):
             lat, lon = _from_points(pts)
             if lat and lon:
                 return lat, lon
-
     return None, None
 
 
@@ -370,9 +368,6 @@ def _extract_grid_points(j):
     return None
 
 
-# -------------------------
-# Baseline parsing (snap requested grid to nearest available OM/IFS points)
-# -------------------------
 def _parse_times_from_hourly_block(block):
     if not isinstance(block, dict) or "time" not in block:
         return None
@@ -383,7 +378,6 @@ def _parse_times_from_hourly_block(block):
 
 
 def _extract_times(j):
-    # prefer meta start/end (request-based), fall back to first OM item
     m = j.get("meta", {}) or {}
     try:
         t0 = dt.datetime.fromisoformat(m["start"])
@@ -397,37 +391,29 @@ def _extract_times(j):
     om = j.get("om")
     if isinstance(om, dict) and "hourly" in om:
         t = _parse_times_from_hourly_block(om["hourly"])
-        if t:
-            return t
+        return t if t else None
     if isinstance(om, list) and om:
         hb = om[0].get("hourly", {})
         t = _parse_times_from_hourly_block(hb)
-        if t:
-            return t
+        return t if t else None
     return None
 
 
 def _lon_canon(l):
-    # Canonicalize to [-180, 180), mapping +180 -> -180
     x = ((float(l) + 180.0) % 360.0) - 180.0
     return -180.0 if abs(x - 180.0) < 1e-9 else x
 
 
 def _lon_diff_deg(a, b):
-    """Shortest signed lon difference in degrees with ±180 equivalence."""
     A = _lon_canon(a)
     B = _lon_canon(b)
     d = ((A - B + 540.0) % 360.0) - 180.0
-    # Make 180 act like -180 to avoid edge mismatches
     return -180.0 if abs(d - 180.0) < 1e-9 else d
 
 
 def _nearest_idx_points(points_lat, points_lon, req_lat, req_lon):
-    """Return index of nearest point by great-circle-aware degree metric."""
-    # weight longitude by cos(lat) to approximate distance in degrees
     lat_arr = np.asarray(points_lat, dtype=float)
     lon_arr = np.asarray(points_lon, dtype=float)
-
     dlat = lat_arr - float(req_lat)
     dlon = np.array([_lon_diff_deg(l, req_lon) for l in lon_arr], dtype=float)
     w = np.cos(np.deg2rad(float(req_lat)))
@@ -436,14 +422,7 @@ def _nearest_idx_points(points_lat, points_lon, req_lat, req_lon):
 
 
 def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.6):
-    """
-    Build (T,G) array on requested grid by snapping each requested (lat,lon)
-    to the nearest available returned point (lat',lon') within tol_deg.
-    Adds a polar rule: when |lat| >= 89.5°, ignore longitude in distance.
-    """
     T, G = len(times), len(grid)
-
-    # Collect available coordinates and series
     pts_lat, pts_lon, series = [], [], []
     for p in point_list:
         la = p.get("latitude")
@@ -452,11 +431,8 @@ def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.6):
         vals = hb.get(name)
         if la is None or lo is None or vals is None:
             continue
-
         v = np.asarray(vals, dtype=float)
         p_times = _parse_times_from_hourly_block(hb)
-
-        # Align time length to requested axis if needed
         if p_times and len(p_times) == v.size and v.size != T:
             aligned = np.empty(T, dtype=float)
             for i, tt in enumerate(times):
@@ -464,13 +440,10 @@ def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.6):
                 aligned[i] = float(v[j])
             v = aligned
         elif v.size != T:
-            # Can't align → skip this point
             continue
-
         pts_lat.append(float(la))
         pts_lon.append(_lon_canon(lo))
         series.append(v.astype(float))
-
     if not series:
         raise KeyError(f"no points carried var {name}")
 
@@ -482,26 +455,19 @@ def _build_matrix_from_points(point_list, name, times, grid, tol_deg=0.6):
     for gi, (la_req, lo_req) in enumerate(grid):
         la_req = float(la_req)
         lo_req = _lon_canon(lo_req)
-
-        # Polar snap: ignore longitude when near the poles
         if abs(la_req) >= 89.5:
             dlat = np.abs(pts_lat - la_req)
             idx = int(np.argmin(dlat))
-            d2 = float(dlat[idx] ** 2)  # only latitude contributes
+            d2 = float(dlat[idx] ** 2)
         else:
             dlat = pts_lat - la_req
             dlon = np.array([_lon_diff_deg(L, lo_req) for L in pts_lon], dtype=float)
-            w = np.cos(
-                np.deg2rad(la_req)
-            )  # shrink longitudinal distance away from equator
+            w = np.cos(np.deg2rad(la_req))
             dist2 = dlat * dlat + (w * dlon) * (w * dlon)
             idx = int(np.argmin(dist2))
             d2 = float(dist2[idx])
-
         if d2 <= tol2:
             out[:, gi] = series[idx]
-        # else: leave NaN; caller will handle (and we’ll log in the shape check)
-    # If absolutely nothing matched, signal failure
     if np.all(~np.isfinite(out)):
         raise KeyError(f"no points matched requested grid for var {name}")
     return out
@@ -512,8 +478,6 @@ def _parse_baseline(j, key, times, grid, required_vars):
     if blk is None:
         return {v: None for v in required_vars}
     T, G = len(times), len(grid)
-
-    # Case A: block is a dict with "hourly" already (rare in your dumps)
     if isinstance(blk, dict) and "hourly" in blk:
         hourly = blk["hourly"] or {}
         out = {}
@@ -525,8 +489,6 @@ def _parse_baseline(j, key, times, grid, required_vars):
             if out[v] is not None and out[v].shape == (T, 1) and G > 1:
                 out[v] = np.repeat(out[v], G, axis=1)
         return out
-
-    # Case B: list of point objects (typical OM/IFS baseline you saved)
     if isinstance(blk, list):
         out = {}
         for v in required_vars:
@@ -535,12 +497,11 @@ def _parse_baseline(j, key, times, grid, required_vars):
             except KeyError:
                 out[v] = None
         return out
-
     return {v: None for v in required_vars}
 
 
 # -------------------------
-# ERA5 variable resolution + sampling
+# ERA5 resolution + sampling (hybrid + nearest)
 # -------------------------
 VAR_ALIASES = {
     "t2m": ["t2m", "2m_temperature", "temperature_2m"],
@@ -556,6 +517,13 @@ VAR_ALIASES = {
     "v100": ["v100", "100m_v_component_of_wind"],
     "u10": ["u10", "10m_u_component_of_wind"],
     "v10": ["v10", "10m_v_component_of_wind"],
+    # Land extras:
+    "skt": ["skt", "skin_temperature"],
+    "sde": ["sde", "snow_depth"],
+    "swvl1": ["swvl1", "volumetric_soil_water_layer_1"],
+    "swvl2": ["swvl2", "volumetric_soil_water_layer_2"],
+    "swvl3": ["swvl3", "volumetric_soil_water_layer_3"],
+    "swvl4": ["swvl4", "volumetric_soil_water_layer_4"],
 }
 
 
@@ -565,15 +533,11 @@ def _find_var_name(ds: xr.Dataset, key: str) -> str:
     for cand in aliases:
         name = data_vars_lower.get(cand.lower())
         if name is not None:
-            log.debug(
-                f"[resolve] {key} -> {name} (data_var in {getattr(ds, 'encoding', {}).get('source','<mem>')})"
-            )
             return name
     coords_lower = {name.lower(): name for name in ds.coords}
     for cand in aliases:
         name = coords_lower.get(cand.lower())
         if name is not None:
-            log.debug(f"[resolve] {key} -> {name} (coord)")
             return name
     raise KeyError(
         f"No variable named {aliases!r}. Variables include {list(ds.data_vars)}"
@@ -583,7 +547,6 @@ def _find_var_name(ds: xr.Dataset, key: str) -> str:
 def _maybe_squeeze_members(da: xr.DataArray) -> xr.DataArray:
     for extra in ("expver", "number"):
         if extra in da.dims:
-            log.debug(f"[squeeze] selecting last index for dim '{extra}'")
             da = da.isel({extra: -1})
     return da.squeeze(drop=True)
 
@@ -640,7 +603,6 @@ def _index_nearest(vals: np.ndarray, target: float) -> int:
 
 
 def _map_target_lon_for_coords(lon_coords: np.ndarray, lo_req: float) -> float:
-    # map request into dataset's lon frame (0–360 or −180..180); treat +180 == −180
     lon_coords = np.asarray(lon_coords, dtype=float)
     if np.nanmin(lon_coords) >= 0.0 and np.nanmax(lon_coords) > 180.0:
         x = (float(lo_req) + 360.0) % 360.0
@@ -653,31 +615,25 @@ def nearest_truth(ds, key, grid, times):
     vname = _find_var_name(ds, key)
     da = _maybe_squeeze_members(ds[vname])
     lat_dim, lon_dim, time_dim = _dims_for(da)
-
     lats = _coord_values(ds, ("latitude", "lat", "y"))
     lons = _coord_values(ds, ("longitude", "lon", "x"))
     tlist = _time_list(ds)
-
-    # precompute nearest time indices
     t_idx = [
         int(np.argmin([abs((tt - t0).total_seconds()) for t0 in tlist])) for tt in times
     ]
     T, G = len(times), len(grid)
     out = np.empty((T, G), dtype=float)
-
     lats = np.asarray(lats, dtype=float)
     lons = np.asarray(lons, dtype=float)
-
     for gi, (la_req, lo_req) in enumerate(grid):
         la_req = float(la_req)
         if abs(la_req) >= 89.5:
             ilat = _index_nearest(lats, la_req)
-            ilon = 0  # longitude irrelevant at the pole
+            ilon = 0
         else:
             ilat = _index_nearest(lats, la_req)
             lo_adj = _map_target_lon_for_coords(lons, lo_req)
             ilon = _index_nearest(lons, lo_adj)
-
         out[:, gi] = da.isel(
             {lat_dim: ilat, lon_dim: ilon, time_dim: xr.DataArray(t_idx)}
         ).values
@@ -685,34 +641,70 @@ def nearest_truth(ds, key, grid, times):
 
 
 def hybrid_truth(era5_land: xr.Dataset, era5_single: xr.Dataset, key: str, grid, times):
-    """Use ERA5-Land where finite; fall back to Single-levels elsewhere."""
-    # Some vars (u100/v100) exist only in single — handle that quickly
     try_land = _has_var(era5_land, key)
     try_single = _has_var(era5_single, key)
-
     if not try_single and not try_land:
         raise KeyError(f"No dataset provides variable '{key}'")
-
-    # sample what we can from each
-    land_arr = None
-    if try_land:
-        land_arr = nearest_truth(era5_land, key, grid, times)
-
-    single_arr = None
-    if try_single:
-        single_arr = nearest_truth(era5_single, key, grid, times)
-
+    land_arr = nearest_truth(era5_land, key, grid, times) if try_land else None
+    single_arr = nearest_truth(era5_single, key, grid, times) if try_single else None
     if land_arr is None:
         return single_arr
     if single_arr is None:
         return land_arr
-
     land_ok = np.isfinite(land_arr)
     return np.where(land_ok, land_arr, single_arr)
 
 
 # -------------------------
-# Robust parquet writer (with append+dedupe)
+# Feature engineering helpers (new)
+# -------------------------
+def _lags(A: np.ndarray, ks=(1, 3, 6, 24)) -> dict:
+    # A: (T,G)
+    feats = {}
+    for k in ks:
+        lag = np.full_like(A, np.nan, dtype=float)
+        lag[k:, :] = A[:-k, :]
+        feats[f"lag{k}"] = lag
+    return feats
+
+
+def _local_stats(A: np.ndarray, nlat: int, nlon: int, radius=1):
+    # A: (T,G) in row-major flattening with lat major, lon minor
+    out_mean = np.full_like(A, np.nan, dtype=float)
+    out_grad = np.full_like(A, np.nan, dtype=float)
+    for ti in range(A.shape[0]):
+        M = A[ti].reshape(nlat, nlon)
+        # 3x3 mean (naive conv)
+        pad = np.pad(M, radius, mode="edge")
+        acc = np.zeros_like(M)
+        cnt = (2 * radius + 1) ** 2
+        for di in range(-radius, radius + 1):
+            for dj in range(-radius, radius + 1):
+                acc += pad[
+                    radius + di : radius + di + nlat, radius + dj : radius + dj + nlon
+                ]
+        mean3 = acc / cnt
+        # gradient magnitude
+        gx = np.zeros_like(M)
+        gy = np.zeros_like(M)
+        gx[:, 1:-1] = (M[:, 2:] - M[:, :-2]) * 0.5
+        gy[1:-1, :] = (M[2:, :] - M[:-2, :]) * 0.5
+        grad = np.hypot(gx, gy)
+        out_mean[ti] = mean3.reshape(-1)
+        out_grad[ti] = grad.reshape(-1)
+    return out_mean, out_grad
+
+
+def _unique_lat_lon_counts(grid):
+    lats = [la for la, _ in grid]
+    lons = [lo for _, lo in grid]
+    nlat = len(sorted(set([round(float(x), 6) for x in lats])))
+    nlon = len(sorted(set([round(float(x), 6) for x in lons])))
+    return nlat if nlat > 0 else 1, nlon if nlon > 0 else max(1, len(grid))
+
+
+# -------------------------
+# Robust parquet writer (append+dedupe)
 # -------------------------
 def safe_to_parquet(
     df: pd.DataFrame, path: str, append: bool = False, subset=("lat", "lon", "time")
@@ -722,12 +714,11 @@ def safe_to_parquet(
     def _write(df_final: pd.DataFrame):
         engines = []
         try:
-            import fastparquet  # noqa: F401
+            import fastparquet  # noqa
 
             engines.append(("fastparquet", {}))
         except Exception:
             pass
-
         last_err = None
         for eng, kwargs in engines:
             try:
@@ -737,8 +728,6 @@ def safe_to_parquet(
             except Exception as e:
                 log.warning(f"[parquet] engine={eng} failed: {e!r}")
                 last_err = e
-
-        # Final fallback: CSV
         csv_path = os.path.splitext(path)[0] + ".csv"
         df_final.to_csv(csv_path, index=False)
         log.error(
@@ -784,6 +773,7 @@ def main():
     log.info(f"Loading ERA5-Land:  {args.era5_land}")
     era5_land = xr.open_dataset(args.era5_land)
 
+    # Rows per target (same keys as before)
     rows = {k: [] for k in ["t2m", "td2m", "psfc", "tp", "wspd100", "wdir100"]}
 
     files = sorted(glob.glob(os.path.join(OM_DIR, "omifs_*.json")))
@@ -807,7 +797,6 @@ def main():
         if base in processed:
             log.info(f"[pair] skip already processed: {base}")
             continue
-
         try:
             with open(p, "r") as f:
                 j = json.load(f)
@@ -830,13 +819,19 @@ def main():
             log.warning(f"[pair] skip {base} (empty times or grid)")
             continue
 
-        log.info(f"[pair] {base}: T={T}, G={G}")
+        nlat, nlon = _unique_lat_lon_counts(grid)
+        log.info(f"[pair] {base}: T={T}, G={G} (nlat={nlat}, nlon={nlon})")
 
         t0 = times[0]
         leads = np.array(
             [(t - t0).total_seconds() / 3600.0 for t in times], dtype=float
         )
         hods = np.array([t.hour + t.minute / 60 for t in times], dtype=float)
+        doys = np.array([t.timetuple().tm_yday for t in times], dtype=float)
+        hod_sin = np.sin(2 * np.pi * hods / 24.0)
+        hod_cos = np.cos(2 * np.pi * hods / 24.0)
+        doy_sin = np.sin(2 * np.pi * doys / 365.25)
+        doy_cos = np.cos(2 * np.pi * doys / 365.25)
 
         om_vars = _parse_baseline(j, "om", times, grid, needed)
         ifs_vars = _parse_baseline(j, "ifs", times, grid, needed)
@@ -893,9 +888,8 @@ def main():
             log.warning(f"[pair] skip {base} (shape issue: {e})")
             continue
 
-        # ERA5 truth sampling on requested grid/time
+        # ERA5 truth sampling (hybrid where available)
         try:
-            # Use hybrid for global coverage (ocean + land)
             t2m_truth = to_celsius(
                 hybrid_truth(era5_land, era5_single, "t2m", grid, times)
             )
@@ -906,17 +900,44 @@ def main():
             sp_truth = pa_to_hpa(
                 hybrid_truth(era5_land, era5_single, "sp", grid, times)
             )
-
-            # 100 m winds: come from single-levels
             u100 = nearest_truth(era5_single, "u100", grid, times)
             v100 = nearest_truth(era5_single, "v100", grid, times)
             wspd_truth = ms_to_kmh(np.hypot(u100, v100))
             wdir_truth = (np.degrees(np.arctan2(-u100, -v100)) + 360.0) % 360.0
+
+            # ERA5-Land exogenous predictors (used as features)
+            skt = hybrid_truth(era5_land, era5_single, "skt", grid, times)  # K
+            sde = hybrid_truth(era5_land, era5_single, "sde", grid, times)  # m
+            swvl1 = hybrid_truth(era5_land, era5_single, "swvl1", grid, times)
+            swvl2 = hybrid_truth(era5_land, era5_single, "swvl2", grid, times)
+            swvl3 = hybrid_truth(era5_land, era5_single, "swvl3", grid, times)
+            swvl4 = hybrid_truth(era5_land, era5_single, "swvl4", grid, times)
         except Exception as e:
             log.warning(f"[pair] skip {base} (ERA5 sample error: {e})")
             continue
 
-        def emit(rows_list, bom, bifs, truth):
+        # Derived baseline transforms (shared)
+        TminusTd = b_t2m_om - b_td2m_om
+        wdir_rad = np.deg2rad(b_wdir_om)
+        u_om = -b_wspd_om * np.sin(wdir_rad)
+        v_om = -b_wspd_om * np.cos(wdir_rad)
+        dspfc_3h = np.full_like(b_psfc_om, np.nan)
+        dspfc_3h[3:, :] = b_psfc_om[3:, :] - b_psfc_om[:-3, :]
+
+        # Spatial stats on a representative baseline (t2m) for local context
+        t2m_mean3, t2m_grad3 = _local_stats(b_t2m_om, nlat, nlon, radius=1)
+
+        # Variable-specific lag bundles (baseline_om)
+        lags = {
+            "t2m": _lags(b_t2m_om),
+            "td2m": _lags(b_td2m_om),
+            "psfc": _lags(b_psfc_om),
+            "tp": _lags(b_tp_om),
+            "wspd100": _lags(b_wspd_om),
+            "wdir100": _lags(b_wdir_om),
+        }
+
+        def emit(rows_list, bom, bifs, truth, var_key: str):
             for gi, (la, lo) in enumerate(grid):
                 for ti, tt in enumerate(times):
                     bomv = float(bom[ti, gi])
@@ -925,25 +946,48 @@ def main():
                         if (bifs is not None and np.isfinite(bifs[ti, gi]))
                         else np.nan
                     )
-                    rows_list.append(
-                        {
-                            "lat": la,
-                            "lon": lo,
-                            "hod": float(hods[ti]),
-                            "lead": float(leads[ti]),
-                            "baseline_om": bomv,
-                            "baseline_ifs": bifsv,
-                            "target": float(truth[ti, gi]),
-                            "time": times[ti].isoformat(),
-                        }
-                    )
+                    row = {
+                        # core features (backward compatible)
+                        "lat": la,
+                        "lon": lo,
+                        "hod": float(hods[ti]),
+                        "lead": float(ti),
+                        "baseline_om": bomv,
+                        "baseline_ifs": bifsv,
+                        "target": float(truth[ti, gi]),
+                        "time": times[ti].isoformat(),
+                        # cycles
+                        "hod_sin": float(hod_sin[ti]),
+                        "hod_cos": float(hod_cos[ti]),
+                        "doy_sin": float(doy_sin[ti]),
+                        "doy_cos": float(doy_cos[ti]),
+                        # transforms
+                        "tminus_td": float(TminusTd[ti, gi]),
+                        "u100_om": float(u_om[ti, gi]),
+                        "v100_om": float(v_om[ti, gi]),
+                        "dspfc_3h": float(dspfc_3h[ti, gi]),
+                        # simple spatial context
+                        "t2m_mean3": float(t2m_mean3[ti, gi]),
+                        "t2m_grad3": float(t2m_grad3[ti, gi]),
+                        # land exogenous (converted where helpful)
+                        "skin_temp": float(to_celsius(skt[ti, gi])),
+                        "snow_depth": float(sde[ti, gi]),
+                        "swvl1": float(swvl1[ti, gi]),
+                        "swvl2": float(swvl2[ti, gi]),
+                        "swvl3": float(swvl3[ti, gi]),
+                        "swvl4": float(swvl4[ti, gi]),
+                    }
+                    # lags for the current variable's baseline_om
+                    for k, A in lags[var_key].items():
+                        row[k] = float(A[ti, gi])
+                    rows_list.append(row)
 
-        emit(rows["t2m"], b_t2m_om, b_t2m_ifs, t2m_truth)
-        emit(rows["td2m"], b_td2m_om, b_td2m_ifs, td2m_truth)
-        emit(rows["psfc"], b_psfc_om, b_psfc_ifs, sp_truth)
-        emit(rows["tp"], b_tp_om, b_tp_ifs, tp_truth)
-        emit(rows["wspd100"], b_wspd_om, b_wspd_ifs, wspd_truth)
-        emit(rows["wdir100"], b_wdir_om, b_wdir_ifs, wdir_truth)
+        emit(rows["t2m"], b_t2m_om, b_t2m_ifs, t2m_truth, "t2m")
+        emit(rows["td2m"], b_td2m_om, b_td2m_ifs, td2m_truth, "td2m")
+        emit(rows["psfc"], b_psfc_om, b_psfc_ifs, sp_truth, "psfc")
+        emit(rows["tp"], b_tp_om, b_tp_ifs, tp_truth, "tp")
+        emit(rows["wspd100"], b_wspd_om, b_wspd_ifs, wspd_truth, "wspd100")
+        emit(rows["wdir100"], b_wdir_om, b_wdir_ifs, wdir_truth, "wdir100")
 
         log.info(f"paired {base} → {args.tile_id}")
         new_processed.append(base)
