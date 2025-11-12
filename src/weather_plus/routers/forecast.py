@@ -1,5 +1,6 @@
 import logging
 import time
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -22,6 +23,14 @@ log = logging.getLogger("weather_plus.api")
 MC = ModelCache(
     model_dir=__import__("src.weather_plus.config", fromlist=[""]).MODEL_DIR
 )  # noqa: E402
+
+
+def _mk_assemble_adapter(feature_names):
+    """
+    assemble_X historically expects an object with .feature_names.
+    For Option A dict-bundles, adapt with a tiny namespace holding that attribute.
+    """
+    return SimpleNamespace(feature_names=feature_names or [])
 
 
 @router.get("/v1/forecast")
@@ -133,60 +142,36 @@ def forecast(
 
         for var in vars_req:
             t0 = time.perf_counter()
-            bundle = MC.load(var, tid)
+            bundle_obj = MC.load(var, tid)  # may be dict (Option A) or legacy object
             t1 = time.perf_counter()
 
-            # Back-compat: simple estimators may have no feature_names/meta
-            if not hasattr(bundle, "feature_names"):
-                legacy = bundle
-                bom = base_om.get(var)
-                if bom is None:
-                    log.error(
-                        "req=%s pt=%d var=%s legacy missing baseline OM", req_id, i, var
-                    )
-                    raise HTTPException(500, f"Missing legacy baseline {var}")
-                bif = base_ifs.get(var, bom)
-                hod = np.array([t.hour + t.minute / 60.0 for t in times], dtype=float)
-                lead = np.arange(len(times), dtype=float)
-                X = np.column_stack(
-                    [np.full_like(hod, la), np.full_like(hod, lo), hod, lead, bom, bif]
-                )
-                y = legacy.predict(X)
-                H[var] = np.asarray(y, dtype=float).tolist()
-                t2 = time.perf_counter()
-                log.info(
-                    "req=%s var=%s tile=%s task=legacy n=%d load=%.3fs infer=%.3fs",
-                    req_id,
-                    var,
-                    tid,
-                    len(times),
-                    (t1 - t0),
-                    (t2 - t1),
-                )
-                continue
+            model = bundle_obj.get("model")
+            feature_names = bundle_obj.get("feature_names", [])
+            meta = bundle_obj.get("meta", {}) or {}
+            task = meta.get("task", "reg")
 
-            # Modern bundles
-            bundle.meta = getattr(bundle, "meta", {"task": "reg"})
-            X, _ = assemble_X(bundle, var, la, lo, times, base_om, base_ifs)
-            task = bundle.meta.get("task", "reg")
+            # assemble_X expects an object with .feature_names
+            adapter = _mk_assemble_adapter(feature_names)
+            X, _ = assemble_X(adapter, var, la, lo, times, base_om, base_ifs)
 
             # Predict according to task kind
             if task == "tp2stage":
-                clf, reg = bundle.model
+                clf, reg = model
+                # HGBClassifier has predict_proba
                 p = np.clip(clf.predict_proba(X)[:, 1], 0, 1)
                 y = np.expm1(reg.predict(X))
                 out_vals = (p * y).astype(float)
             elif task == "wspd":
-                y = bundle.model.predict(X)
+                y = model.predict(X)
                 out_vals = np.clip(y**2, 0, None).astype(float)
             elif task == "wdir":
-                ms, mc = bundle.model
+                ms, mc = model
                 s = ms.predict(X)
                 c = mc.predict(X)
                 ang = (np.degrees(np.arctan2(s, c)) + 360.0) % 360.0
                 out_vals = ang.astype(float)
             else:
-                out_vals = bundle.model.predict(X).astype(float)
+                out_vals = model.predict(X).astype(float)
 
             H[var] = out_vals.tolist()
             t2 = time.perf_counter()
@@ -200,8 +185,7 @@ def forecast(
                 (t1 - t0),
                 (t2 - t1),
             )
-            if log.isEnabledFor(logging.DEBUG):
-                # quick sanity stats
+            if log.isEnabledFor(logging.DEBUG) and len(out_vals):
                 log.debug(
                     "req=%s var=%s tile=%s stats min=%.4f max=%.4f mean=%.4f",
                     req_id,

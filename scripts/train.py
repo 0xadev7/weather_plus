@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import os, glob, json, joblib, numpy as np, pandas as pd
-from dataclasses import dataclass
 from sklearn.ensemble import (
     HistGradientBoostingRegressor,
     HistGradientBoostingClassifier,
@@ -49,16 +48,13 @@ EXTRA = [
 PREF = BASE + EXTRA
 
 
-@dataclass
-class Bundle:
-    model: object
-    feature_names: list
-    meta: dict
-
-
 def _select_X(df, pref=PREF):
     cols = [c for c in pref if c in df.columns]
     return df[cols].values, cols
+
+
+def _bundle(model, cols, task):
+    return {"model": model, "feature_names": cols, "meta": {"task": task}}
 
 
 def fit_reg(df):
@@ -73,7 +69,7 @@ def fit_reg(df):
         validation_fraction=0.1,
     )
     m.fit(X, y)
-    return Bundle(m, cols, {"task": "reg"})
+    return _bundle(m, cols, "reg")
 
 
 def fit_tp_two_stage(df):
@@ -82,21 +78,19 @@ def fit_tp_two_stage(df):
     wet = (y > 0.0).astype(int)
     clf = HistGradientBoostingClassifier(max_leaf_nodes=31, learning_rate=0.06)
     clf.fit(X, wet)
-    # regress on wet-only, log1p
     mask = wet == 1
     reg = HistGradientBoostingRegressor(max_leaf_nodes=31, learning_rate=0.06)
     reg.fit(X[mask], np.log1p(y[mask]))
-    return Bundle((clf, reg), cols, {"task": "tp2stage"})
+    return _bundle((clf, reg), cols, "tp2stage")
 
 
 def fit_wspd(df):
-    # sqrt trick + HGBR
     df = df.copy()
     df["tgt"] = np.sqrt(np.clip(df["target"].values, 0, None))
     X, cols = _select_X(df)
     m = HistGradientBoostingRegressor(max_leaf_nodes=31, learning_rate=0.06)
     m.fit(X, df["tgt"].values)
-    return Bundle(m, cols, {"task": "wspd"})
+    return _bundle(m, cols, "wspd")
 
 
 def fit_wdir(df):
@@ -106,14 +100,14 @@ def fit_wdir(df):
     mc = HistGradientBoostingRegressor(max_leaf_nodes=31, learning_rate=0.06)
     ms.fit(X, np.sin(th))
     mc.fit(X, np.cos(th))
-    return Bundle((ms, mc), cols, {"task": "wdir"})
+    return _bundle((ms, mc), cols, "wdir")
 
 
 FIT = {"reg": fit_reg, "tp2stage": fit_tp_two_stage, "wspd": fit_wspd, "wdir": fit_wdir}
 
 
 def _save(bundle, out):
-    joblib.dump(bundle, out)
+    joblib.dump(bundle, out, compress=3, protocol=4)
 
 
 tiles = sorted(
