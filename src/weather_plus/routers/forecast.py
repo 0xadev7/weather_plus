@@ -26,10 +26,7 @@ MC = ModelCache(
 
 
 def _mk_assemble_adapter(feature_names):
-    """
-    assemble_X historically expects an object with .feature_names.
-    For Option A dict-bundles, adapt with a tiny namespace holding that attribute.
-    """
+    """assemble_X expects an object with .feature_names."""
     return SimpleNamespace(feature_names=feature_names or [])
 
 
@@ -45,7 +42,6 @@ def forecast(
     timeformat: str = Query("iso8601"),
     models: Optional[str] = Query(None),
 ):
-    # Correlate with middleware request id if present
     req_id = request.headers.get("x-request-id", "n/a")
 
     # ---------- Parse inputs ----------
@@ -124,8 +120,8 @@ def forecast(
             ifs_ok,
         )
 
-    # Utility to convert OM block -> {var: np.array([...])}
     def _blk_to_map(block):
+        # {var: np.array([...])} for all SUPPORTED, if present
         return {k: extract_hourly(block, k) for k in SUPPORTED}
 
     out = []
@@ -142,22 +138,18 @@ def forecast(
 
         for var in vars_req:
             t0 = time.perf_counter()
-            bundle_obj = MC.load(var, tid)  # may be dict (Option A) or legacy object
+            bundle_obj = MC.load(var, tid)  # dict with model, feature_names, meta.task
             t1 = time.perf_counter()
 
             model = bundle_obj.get("model")
             feature_names = bundle_obj.get("feature_names", [])
-            meta = bundle_obj.get("meta", {}) or {}
-            task = meta.get("task", "reg")
+            task = (bundle_obj.get("meta") or {}).get("task", "reg")
 
-            # assemble_X expects an object with .feature_names
             adapter = _mk_assemble_adapter(feature_names)
             X, _ = assemble_X(adapter, var, la, lo, times, base_om, base_ifs)
 
-            # Predict according to task kind
             if task == "tp2stage":
                 clf, reg = model
-                # HGBClassifier has predict_proba
                 p = np.clip(clf.predict_proba(X)[:, 1], 0, 1)
                 y = np.expm1(reg.predict(X))
                 out_vals = (p * y).astype(float)
