@@ -14,6 +14,7 @@ class ModelCache:
         ]
 
     def load(self, var: str, tile: str):
+        print(var, tile)
         key = (var, tile)
         if key in self.memo:
             return self.memo[key]
