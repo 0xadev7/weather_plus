@@ -13,5 +13,11 @@ SUPPORTED = {
     "precipitation": "precipitation",
     "wind_speed_100m": "wind_speed_100m",
     "wind_direction_100m": "wind_direction_100m",
+    "skin_temperature": "skin_temperature",
+    "snow_depth": "snow_depth",
+    "volumetric_soil_water_layer_1": "volumetric_soil_water_layer_1",
+    "volumetric_soil_water_layer_2": "volumetric_soil_water_layer_2",
+    "volumetric_soil_water_layer_3": "volumetric_soil_water_layer_3",
+    "volumetric_soil_water_layer_4": "volumetric_soil_water_layer_4",
 }
 BASELINE_NEEDED = ",".join(SUPPORTED.keys())
