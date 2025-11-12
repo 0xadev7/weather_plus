@@ -218,35 +218,65 @@ def assemble_X(
     if "snow_depth" in base_om:
         coll["snow_depth"] = _safe(base_om["snow_depth"])
 
-    t = {
-        "0_1": 1,
-        "1_3": 2,
-        "3_9": 6,
-        "9_27": 18,
-        "27_81": 54,
-    }
-    sm = {
-        "0_1": _safe(base_om["soil_moisture_0_to_1cm"]) or 0,
-        "1_3": _safe(base_om["soil_moisture_1_to_3cm"]) or 0,
-        "3_9": _safe(base_om["soil_moisture_3_to_9cm"]) or 0,
-        "9_27": _safe(base_om["soil_moisture_9_to_27cm"]) or 0,
-        "27_81": _safe(base_om["soil_moisture_27_to_81cm"]) or 0,
-    }
+    if "soil_moisture_0_to_1cm" in base_om:
+        coll["soil_moisture_0_to_1cm"] = _safe(base_om["soil_moisture_0_to_1cm"])
+    if "soil_moisture_1_to_3cm" in base_om:
+        coll["soil_moisture_1_to_3cm"] = _safe(base_om["soil_moisture_1_to_3cm"])
+    if "soil_moisture_3_to_9cm" in base_om:
+        coll["soil_moisture_3_to_9cm"] = _safe(base_om["soil_moisture_3_to_9cm"])
+    if "soil_moisture_9_to_27cm" in base_om:
+        coll["soil_moisture_9_to_27cm"] = _safe(base_om["soil_moisture_9_to_27cm"])
+    if "soil_moisture_27_to_81cm" in base_om:
+        coll["soil_moisture_27_to_81cm"] = _safe(base_om["soil_moisture_27_to_81cm"])
 
-    # Approximate ERA5 layers:
-    coll["swvl1"] = (
-        t["0_1"] * sm["0_1"] + t["1_3"] * sm["1_3"] + t["3_9"] * sm["3_9"]
-    ) / (
-        t["0_1"] + t["1_3"] + t["3_9"]
-    )  # 0–7 cm ~ 0–9 cm
-    coll["swvl2"] = (t["9_27"] * sm["9_27"] + (7 / 54) * t["27_81"] * sm["27_81"]) / (
-        t["9_27"] + (7 / 54) * t["27_81"]
-    )  # ~7–28 cm
-    coll["swvl3"] = ((21 / 54) * t["27_81"] * sm["27_81"]) / (
-        (21 / 54) * t["27_81"]
-    )  # ~28–100 cm (coarse)
-    # swvl4 (100–289 cm) not covered by OM’s 27–81 cm; omit unless you add a model with deeper soil.
-    coll["swvl4"] = np.full(T, np.nan, dtype=float)
+    have_soil_moisture = all(
+        k in coll and coll[k] is not None
+        for k in [
+            "soil_moisture_0_to_1cm",
+            "soil_moisture_1_to_3cm",
+            "soil_moisture_3_to_9cm",
+            "soil_moisture_9_to_27cm",
+            "soil_moisture_27_to_81cm",
+        ]
+    )
+
+    if have_soil_moisture:
+        t = {
+            "0_1": 1.0,
+            "1_3": 2.0,
+            "3_9": 6.0,
+            "9_27": 18.0,
+            "27_81": 54.0,
+        }  # cm thickness
+        sm = {
+            "0_1": coll["soil_moisture_0_to_1cm"],
+            "1_3": coll["soil_moisture_1_to_3cm"],
+            "3_9": coll["soil_moisture_3_to_9cm"],
+            "9_27": coll["soil_moisture_9_to_27cm"],
+            "27_81": coll["soil_moisture_27_to_81cm"],
+        }
+
+        # swvl1 (~0–7 cm) ≈ weighted mean of 0–1, 1–3, 3–9
+        num = t["0_1"] * sm["0_1"] + t["1_3"] * sm["1_3"] + t["3_9"] * sm["3_9"]
+        den = t["0_1"] + t["1_3"] + t["3_9"]
+        coll["swvl1"] = num / den
+
+        # swvl2 (~7–28 cm) ≈ 9–27 plus a 7/54 slice of 27–81
+        num = t["9_27"] * sm["9_27"] + (7.0 / 54.0) * t["27_81"] * sm["27_81"]
+        den = t["9_27"] + (7.0 / 54.0) * t["27_81"]
+        coll["swvl2"] = num / den
+
+        # swvl3 (~28–100 cm) ≈ use the remaining 21/54 of 27–81 as a coarse proxy
+        weight = (21.0 / 54.0) * t["27_81"]
+        coll["swvl3"] = (weight * sm["27_81"]) / weight
+
+        # swvl4 (100–289 cm) cannot be synthesized from 27–81; omit on purpose.
+        coll["swvl4"] = np.full(T, np.nan, dtype=float)
+    else:
+        coll["swvl1"] = np.full(T, np.nan, dtype=float)
+        coll["swvl2"] = np.full(T, np.nan, dtype=float)
+        coll["swvl3"] = np.full(T, np.nan, dtype=float)
+        coll["swvl4"] = np.full(T, np.nan, dtype=float)
 
     # - Lag features of the *target variable's* baseline_om
     #   (lag1, lag3, lag6, lag24). Only compute when requested.
