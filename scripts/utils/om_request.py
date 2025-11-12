@@ -2,7 +2,7 @@ import time
 import os
 import requests, random
 
-from .rate_limiter import MultiWindowRateLimiter
+from rate_limiter import MultiWindowRateLimiter
 
 # Create a single global limiter instance (module-level)
 OM_LIMITER = MultiWindowRateLimiter(

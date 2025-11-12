@@ -3,7 +3,7 @@ import os, json, argparse, time, datetime as dt
 import math
 import requests
 
-from .utils.om_request import om_request
+from utils.om_request import om_request
 
 OM_URL = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
 OUT_DIR = os.path.join("data", "om_baseline")
