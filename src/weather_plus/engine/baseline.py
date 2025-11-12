@@ -36,7 +36,7 @@ def fetch_openmeteo(lat_seq, lon_seq, start_hour, end_hour, models=None):
     params = {
         "latitude": ",".join(f"{x:.6f}" for x in lat_seq),
         "longitude": ",".join(f"{x:.6f}" for x in lon_seq),
-        "hourly": ",".join(BASELINE_NEEDED),
+        "hourly": BASELINE_NEEDED,
         "start_hour": start_hour,
         "end_hour": end_hour,
         "timezone": "UTC",
