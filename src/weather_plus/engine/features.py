@@ -63,6 +63,10 @@ def assemble_X(
 
     feat_names = getattr(bundle, "feature_names", None)
     legacy_name = var
+    
+    print("Feat names: ", feat_names)
+    print(base_om)
+    print(base_ifs)
 
     if feat_names is None:
         bom = base_om.get(legacy_name)
