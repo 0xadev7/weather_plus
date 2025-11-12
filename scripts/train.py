@@ -128,7 +128,7 @@ for tile in tiles:
             continue
         bundle = FIT[kind](df)
         _save(bundle, os.path.join(MODEL_DIR, f"{var}__{tile}.joblib"))
-        print("saved", var, tile, "with", len(bundle.feature_names), "features")
+        print("saved", var, tile, "with", len(bundle["feature_names"]), "features")
 
 # Global fallback
 for key, var, kind in TASKS:
@@ -140,4 +140,4 @@ for key, var, kind in TASKS:
         continue
     bundle = FIT[kind](df)
     _save(bundle, os.path.join(MODEL_DIR, f"{var}.joblib"))
-    print("saved global", var, "with", len(bundle.feature_names), "features")
+    print("saved global", var, "with", len(bundle["feature_names"]), "features")
