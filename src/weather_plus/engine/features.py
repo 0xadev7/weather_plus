@@ -226,11 +226,11 @@ def assemble_X(
         "27_81": 54,
     }
     sm = {
-        "0_1": coll["soil_moisture_0_to_1cm"],
-        "1_3": coll["soil_moisture_1_to_3cm"],
-        "3_9": coll["soil_moisture_3_to_9cm"],
-        "9_27": coll["soil_moisture_9_to_27cm"],
-        "27_81": coll["soil_moisture_27_to_81cm"],
+        "0_1": _safe(base_om["soil_moisture_0_to_1cm"]) or 0,
+        "1_3": _safe(base_om["soil_moisture_1_to_3cm"]) or 0,
+        "3_9": _safe(base_om["soil_moisture_3_to_9cm"]) or 0,
+        "9_27": _safe(base_om["soil_moisture_9_to_27cm"]) or 0,
+        "27_81": _safe(base_om["soil_moisture_27_to_81cm"]) or 0,
     }
 
     # Approximate ERA5 layers:
