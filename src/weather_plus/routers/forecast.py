@@ -47,7 +47,7 @@ def forecast(
         )
         try:
             ifs_points = baseline.fetch_openmeteo(
-                latitude, longitude, start_hour, end_hour, models="ecmwf_ifs"
+                latitude, longitude, start_hour, end_hour, models="ecmwf_ifs025"
             )
         except Exception:
             ifs_points = None

@@ -108,7 +108,7 @@ def get_om(
         "end_hour": end_hour,
         "timezone": "UTC",
         "timeformat": "iso8601",
-        "cell_selection": "nearest"
+        "cell_selection": "nearest",
     }
     if models:
         params["models"] = models
@@ -238,7 +238,7 @@ def main():
                         args.hourly,
                         s,
                         e,
-                        models="ecmwf_ifs",
+                        models="ecmwf_ifs025",
                         timeout=args.timeout,
                     )
                     if (
@@ -247,7 +247,7 @@ def main():
                     ):
                         if tries > args.retries_429:
                             print(
-                                f"[warn] ecmwf_ifs: too many 429s for batch {tag}, skipping"
+                                f"[warn] ecmwf_ifs025: too many 429s for batch {tag}, skipping"
                             )
                             break
                         waited = _respect_retry_after(resp2)
@@ -257,7 +257,7 @@ def main():
                     ifs = resp2.json()
                     break
             except Exception as ex:
-                print(f"[warn] ecmwf_ifs request failed for {tag}: {ex}")
+                print(f"[warn] ecmwf_ifs025 request failed for {tag}: {ex}")
 
             out = {
                 "meta": {
