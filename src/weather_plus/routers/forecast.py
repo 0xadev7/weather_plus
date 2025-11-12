@@ -86,13 +86,13 @@ def forecast(
     om_points = ifs_points = None
     if USE_BASELINE:
         t0 = time.perf_counter()
-        om_points = baseline.fetch_openmeteo(
+        om_points = baseline.get_om(
             latitude, longitude, start_hour, end_hour, models=None
         )
         t1 = time.perf_counter()
         ifs_ok = True
         try:
-            ifs_points = baseline.fetch_openmeteo(
+            ifs_points = baseline.get_om(
                 latitude, longitude, start_hour, end_hour, models="ecmwf_ifs025"
             )
         except Exception as e:
