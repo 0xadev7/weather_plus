@@ -25,7 +25,7 @@ def times_between(start_iso: str, end_iso: str) -> List[datetime]:
 
     out = []
     t = t0
-    while t < t1:
+    while t <= t1:
         out.append(t.replace(microsecond=0))
         t += timedelta(hours=1)
     return out
