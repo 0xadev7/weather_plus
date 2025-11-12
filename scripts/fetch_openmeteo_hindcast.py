@@ -3,6 +3,8 @@ import os, json, argparse, time, datetime as dt
 import math
 import requests
 
+from .utils.om_request import om_request
+
 OM_URL = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
 OUT_DIR = os.path.join("data", "om_baseline")
 
@@ -113,11 +115,7 @@ def get_om(
     if models:
         params["models"] = models
 
-    r = session.get(OM_URL, params=params, timeout=timeout)
-    # Manually handle 429 to honor Retry-After in caller loop.
-    if r.status_code == 429:
-        return r  # caller inspects and sleeps
-    r.raise_for_status()
+    r = om_request(OM_URL, params=params, timeout=timeout)
     return r
 
 
@@ -221,6 +219,8 @@ def main():
                     if not waited:
                         time.sleep(2.0 + args.jitter)
                     continue
+                if resp is None:
+                    raise RuntimeError(f"No response for batch {tag}")
                 om = resp.json()
                 break
 
@@ -254,6 +254,11 @@ def main():
                         if not waited:
                             time.sleep(2.0 + args.jitter)
                         continue
+                    if resp2 is None:
+                        print(
+                            f"[warn] ecmwf_ifs025: no response for batch {tag}, skipping"
+                        )
+                        break
                     ifs = resp2.json()
                     break
             except Exception as ex:
