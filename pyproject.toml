@@ -24,7 +24,8 @@ dependencies = [
   "netCDF4",
   "fastparquet",
   "h5netcdf",
-  "cftime"
+  "cftime",
+  "boto3"
 ]
 
 [tool.setuptools.package-dir]

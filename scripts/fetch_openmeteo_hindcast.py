@@ -1,12 +1,20 @@
 #!/usr/bin/env python
-import os, json, argparse, time, datetime as dt
-import math
-import requests
+import os, json, argparse, time, datetime as dt, math, requests, random
+from typing import Optional
 
-from utils.om_request import om_request
+# Support both "utils.*" and local imports for flexibility
+try:
+    from utils.om_request import om_request
+except Exception:
+    from om_request import om_request  # type: ignore
+
+try:
+    from utils.s3_utils import s3_enabled, upload_bytes, object_exists
+except Exception:
+    from s3_utils import s3_enabled, upload_bytes, object_exists  # type: ignore
 
 OM_URL = os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
-OUT_DIR = os.path.join("data", "om_baseline")
+LOCAL_OUT_DIR = os.path.join("data", "om_baseline")
 
 DEFAULT_HOURLY = [
     "temperature_2m",
@@ -24,28 +32,6 @@ def daterange(start: dt.datetime, end: dt.datetime, chunk_hours=168):
         t2 = min(t + dt.timedelta(hours=chunk_hours), end)
         yield t, t2
         t = t2
-
-
-def make_retry_session():
-    # We’ll handle 429 ourselves (Retry-After), let HTTPAdapter retry connections.
-    try:
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-
-        s = requests.Session()
-        retry = Retry(
-            total=3,
-            connect=3,
-            read=3,
-            backoff_factor=0.5,
-            status_forcelist=(500, 502, 503, 504),
-            allowed_methods=("GET",),
-        )
-        s.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=20))
-        s.mount("http://", HTTPAdapter(max_retries=retry, pool_maxsize=20))
-        return s
-    except Exception:
-        return requests.Session()
 
 
 def make_linspace(vmin: float, vmax: float, steps: int):
@@ -87,7 +73,7 @@ def _respect_retry_after(resp):
         return False
     try:
         wait = int(ra)
-        wait = max(0, min(wait, 60))  # cap to be nice
+        wait = max(0, min(wait, 60))  # cap
         if wait > 0:
             time.sleep(wait)
             return True
@@ -132,51 +118,54 @@ def main():
     ap.add_argument("--hourly", nargs="+", default=DEFAULT_HOURLY)
     ap.add_argument("--chunk-hours", type=int, default=168)
 
-    # New: batching / throttling / robustness knobs for free tier
-    ap.add_argument(
-        "--max-locs-per-req",
-        type=int,
-        default=int(os.getenv("OM_MAX_LOCS", "50")),
-        help="Max paired (lat,lon) per API call (free plan: keep small, e.g., 25–100).",
-    )
-    ap.add_argument(
-        "--rps",
-        type=float,
-        default=float(os.getenv("OM_RPS", "0.5")),
-        help="Requests per second throttle (e.g., 0.5 -> one request every 2s).",
-    )
+    # Batching / throttling
+    ap.add_argument("--max-locs", type=int, default=int(os.getenv("OM_MAX_LOCS", "50")))
+    ap.add_argument("--rps", type=float, default=float(os.getenv("OM_RPS", "0.5")))
     ap.add_argument("--timeout", type=int, default=int(os.getenv("OM_TIMEOUT", "120")))
     ap.add_argument(
-        "--retries-429",
-        type=int,
-        default=int(os.getenv("OM_RETRIES_429", "5")),
-        help="Max retries if 429 is returned.",
+        "--retries-429", type=int, default=int(os.getenv("OM_RETRIES_429", "5"))
+    )
+    ap.add_argument("--jitter", type=float, default=0.3)
+
+    # S3 controls
+    ap.add_argument(
+        "--to-s3",
+        action="store_true",
+        default=False,
+        help="Force upload to S3 if WEATHER_S3_BUCKET is configured",
     )
     ap.add_argument(
-        "--jitter",
-        type=float,
-        default=0.3,
-        help="Extra random jitter (seconds) added after 429 or between calls.",
+        "--s3-subdir",
+        type=str,
+        default="om_baseline",
+        help="Subdirectory under WEATHER_S3_PREFIX (default om_baseline)",
     )
+
     args = ap.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # Decide output target
+    use_s3 = args.to_s3 or s3_enabled()
+    if not use_s3:
+        os.makedirs(LOCAL_OUT_DIR, exist_ok=True)
 
     lat_list = make_linspace(args.lat_min, args.lat_max, args.lat_steps)
     lon_list = make_linspace(args.lon_min, args.lon_max, args.lon_steps)
     grid_lat, grid_lon = make_grid_pairs(lat_list, lon_list)
     total_locs = len(grid_lat)
     print(
-        f"[info] total locations: {total_locs} "
-        f"(lat_steps={args.lat_steps} x lon_steps={args.lon_steps}), "
-        f"batching with max_locs_per_req={args.max_locs_per_req}"
+        f"[info] OM total locations: {total_locs} (lat_steps={args.lat_steps} x lon_steps={args.lon_steps})"
     )
+    print(f"[info] Output: {'S3' if use_s3 else 'local'}")
 
     t0 = dt.datetime.fromisoformat(args.start)
     t1 = dt.datetime.fromisoformat(args.end)
 
-    session = make_retry_session()
+    # Keep a lightweight session (requests.adapters handled by om_request)
+    session = requests.Session()
     last_time_holder = [0.0]
+
+    uploaded = 0
+    skipped = 0
 
     for a, b in daterange(t0, t1, args.chunk_hours):
         s = a.strftime("%Y-%m-%dT%H:%M")
@@ -184,17 +173,24 @@ def main():
         print(f"[info] time slice {s} -> {e}")
 
         for lat_chunk, lon_chunk, batch_idx in chunk_pairs(
-            grid_lat, grid_lon, args.max_locs_per_req
+            grid_lat, grid_lon, args.max_locs
         ):
             batch_size = len(lat_chunk)
             tag = f"{a.strftime('%Y%m%d%H')}_{b.strftime('%Y%m%d%H')}_b{batch_idx:03d}_n{batch_size}"
-            out_path = os.path.join(OUT_DIR, f"omifs_{tag}.json")
+            fname = f"omifs_{tag}.json"
 
-            if os.path.exists(out_path):
-                print(f"[skip] exists {out_path}")
-                continue
+            if use_s3:
+                if object_exists(args.s3_subdir, fname):
+                    print(f"[skip] exists s3://.../{args.s3_subdir}/{fname}")
+                    skipped += 1
+                    continue
+            else:
+                out_path = os.path.join(LOCAL_OUT_DIR, fname)
+                if os.path.exists(out_path):
+                    print(f"[skip] exists {out_path}")
+                    skipped += 1
+                    continue
 
-            # Throttle before request
             _sleep_with_rps(args.rps, last_time_holder)
 
             # Combined models
@@ -214,7 +210,6 @@ def main():
                 if isinstance(resp, requests.Response) and resp.status_code == 429:
                     if tries > args.retries_429:
                         raise RuntimeError(f"Too many 429s for batch {tag}")
-                    # Respect Retry-After; add small jitter to avoid thundering herd
                     waited = _respect_retry_after(resp)
                     if not waited:
                         time.sleep(2.0 + args.jitter)
@@ -224,7 +219,7 @@ def main():
                 om = resp.json()
                 break
 
-            # ECMWF IFS (optional, tolerate failures)
+            # ECMWF IFS (optional best-effort)
             ifs = None
             try:
                 _sleep_with_rps(args.rps, last_time_holder)
@@ -281,13 +276,23 @@ def main():
                 "ifs": ifs,
             }
 
-            with open(out_path, "w") as f:
-                json.dump(out, f)
-            print(f"[ok] saved {out_path}")
-
-            # light jitter to spread load
+            blob = json.dumps(out).encode("utf-8")
+            if use_s3:
+                key = upload_bytes(
+                    blob, args.s3_subdir, fname, content_type="application/json"
+                )
+                print(f"[ok] uploaded s3://.../{key}")
+            else:
+                with open(out_path, "w") as f:
+                    f.write(blob.decode("utf-8"))
+                print(f"[ok] saved {out_path}")
+            uploaded += 1
             if args.jitter > 0:
                 time.sleep(args.jitter)
+
+    print(
+        f"[done] uploaded={uploaded}, skipped={skipped}, dest={'S3' if use_s3 else LOCAL_OUT_DIR}"
+    )
 
 
 if __name__ == "__main__":
