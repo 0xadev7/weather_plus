@@ -49,6 +49,25 @@ def make_grid_pairs(lat_list, lon_list):
     return lat_seq, lon_seq
 
 
+def make_bbox_tag(
+    lat_min: float, lat_max: float, lon_min: float, lon_max: float
+) -> str:
+    """
+    Build a compact, filesystem/S3–safe tag for the lat/lon bounding box.
+
+    Example: latm30_000_to_p00_000_lonm060_000_to_m030_000
+    """
+
+    def enc(v: float, width: int = 6, prec: int = 3) -> str:
+        s = f"{v:+0{width}.{prec}f}"  # e.g. +12.345 or -03.000
+        s = s.replace("+", "p").replace("-", "m").replace(".", "_")
+        return s
+
+    return (
+        f"lat{enc(lat_min)}_to_{enc(lat_max)}_" f"lon{enc(lon_min)}_to_{enc(lon_max)}"
+    )
+
+
 def chunk_pairs(lat_seq, lon_seq, max_locs):
     assert len(lat_seq) == len(lon_seq)
     n = len(lat_seq)
@@ -143,6 +162,8 @@ def main():
 
     args = ap.parse_args()
 
+    bbox_tag = make_bbox_tag(args.lat_min, args.lat_max, args.lon_min, args.lon_max)
+
     # Decide output target
     use_s3 = args.to_s3 or s3_enabled()
     if not use_s3:
@@ -176,7 +197,12 @@ def main():
             grid_lat, grid_lon, args.max_locs
         ):
             batch_size = len(lat_chunk)
-            tag = f"{a.strftime('%Y%m%d%H')}_{b.strftime('%Y%m%d%H')}_b{batch_idx:03d}_n{batch_size}"
+            # Include bbox tag so each tile has distinct filenames
+            tag = (
+                f"{bbox_tag}_"
+                f"{a.strftime('%Y%m%d%H')}_{b.strftime('%Y%m%d%H')}_"
+                f"b{batch_idx:03d}_n{batch_size}"
+            )
             fname = f"omifs_{tag}.json"
 
             if use_s3:
