@@ -9,6 +9,20 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 log = logging.getLogger("make_pairs_plus")
 
+# --- S3 helpers for mirroring parquet files ---
+try:
+    from utils.s3_utils import s3_enabled, upload_file
+except Exception:
+    try:
+        from s3_utils import s3_enabled, upload_file  # type: ignore
+    except Exception:
+
+        def s3_enabled() -> bool:
+            return False
+
+        def upload_file(*args, **kwargs):
+            return None
+
 
 # -------------------------
 # Logging / small utils
@@ -724,15 +738,33 @@ def safe_to_parquet(
             try:
                 log.debug(f"[parquet] writing {path} using engine={eng}")
                 df_final.to_parquet(path, engine=eng, index=False, **kwargs)
+                # Mirror to S3 (optional)
+                if s3_enabled():
+                    try:
+                        upload_file(path, subdir="train_tiles", key=None)
+                        log.info(
+                            f"[parquet] mirrored to S3: train_tiles/{os.path.basename(path)}"
+                        )
+                    except Exception as e:
+                        log.warning(f"[parquet] S3 upload failed for {path}: {e!r}")
                 return
             except Exception as e:
                 log.warning(f"[parquet] engine={eng} failed: {e!r}")
                 last_err = e
+        # Fallback: CSV
         csv_path = os.path.splitext(path)[0] + ".csv"
         df_final.to_csv(csv_path, index=False)
         log.error(
             f"[parquet] all parquet engines failed; wrote CSV fallback: {csv_path}"
         )
+        if s3_enabled():
+            try:
+                upload_file(csv_path, subdir="train_tiles", key=None)
+                log.info(
+                    f"[parquet] mirrored CSV to S3: train_tiles/{os.path.basename(csv_path)}"
+                )
+            except Exception as e:
+                log.warning(f"[parquet] S3 upload failed for {csv_path}: {e!r}")
         if last_err:
             log.debug(f"[parquet] last error: {last_err!r}")
 

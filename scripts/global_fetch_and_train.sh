@@ -6,36 +6,39 @@
 # - ERA5 area aligned to tile bounds
 #
 # Outputs:
-#   - data/om_baseline/omifs_*.json
-#   - tiles/LAT<i>_LON<j>_era5_single.nc
-#   - tiles/LAT<i>_LON<j>_era5_land.nc
-#   - data/train_tiles/<TILE>__*.parquet  (ERA5 target, OM features)
+#   - data/om_baseline/omifs_*.json         (or S3 equivalent)
+#   - tiles/LAT<i}_LON<j>_era5_single.nc    (if not using S3-only mode)
+#   - tiles/LAT<i}_LON<j>_era5_land.nc
+#   - data/train_tiles/<TILE>__*.parquet    (also mirrored to S3)
 #
 # Assumes these scripts exist (from your repo):
 #   scripts/fetch_openmeteo_hindcast.py
 #   scripts/fetch_era5_single_levels.py
 #   scripts/fetch_era5_land.py
 #   scripts/make_training_pairs_tile.py
-#
-# Tip (quick test from Lisbon tile): keep TILE_SAMPLE_COUNT=1 and defaults below.
 
 set -euo pipefail
 export HDF5_USE_FILE_LOCKING=FALSE
 
 # -----------------------------
-# Time window (7-day test default)
+# Time window (default: 2022-01-01 → "now")
 # -----------------------------
-START="${START:-2025-10-25T00:00}"
-END="${END:-2025-11-01T00:00}"
+START="${START:-2022-01-01T00:00}"
+
+# If END not provided, default to current UTC hour
+if [[ -z "${END:-}" ]]; then
+    END="$(date -u +%Y-%m-%dT%H:00)"
+fi
+
 CHUNK_HOURS="${CHUNK_HOURS:-168}"   # OM batch window
 
 # -----------------------------
 # Tiling
 # -----------------------------
-# "Coarse" global tiling with 30° bins by default
 BREAKDOWN_DEG="${BREAKDOWN_DEG:-30}"
 
-# Process only the first N tiles for testing (default: 1 tile)
+# Process only the first N tiles for testing (default: 1 tile).
+# For full globe set TILE_SAMPLE_COUNT to a large number, e.g. 999999.
 TILE_SAMPLE_COUNT="${TILE_SAMPLE_COUNT:-1}"
 
 # Optional include/exclude regex for tile names (applied after enumeration)
@@ -45,11 +48,9 @@ TILE_EXCLUDE_REGEX="${TILE_EXCLUDE_REGEX:-}"
 # -----------------------------
 # Open-Meteo request shape
 # -----------------------------
-# Use 5x5 points per tile for OM so OM/ERA5 alignment is straightforward
 LAT_STEPS="${LAT_STEPS:-5}"
 LON_STEPS="${LON_STEPS:-5}"
 
-# Throttling-friendly defaults (free plan safe-ish)
 OM_MAX_LOCS="${OM_MAX_LOCS:-25}"
 OM_RPS="${OM_RPS:-0.33}"
 OM_RETRIES_429="${OM_RETRIES_429:-6}"
@@ -193,16 +194,16 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
                 --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
                 --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
                 --start \"$START\" --end \"$END\" \
-                --debug-merge --prune-parts \
+                --debug-merge \
                 --outfile \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\"" \
                 "logs/${TILE}_era5_single.log"
                 
                 run_logged \
                 "python \"$ERA5_LAND_SCRIPT\" \
-                --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
+                --lat-min \"$LAT_MIN\" --lat-max \"$LON_MIN\" \
                 --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
                 --start \"$START\" --end \"$END\" \
-                --debug-merge --prune-parts \
+                --debug-merge \
                 --outfile \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\"" \
                 "logs/${TILE}_era5_land.log"
             else

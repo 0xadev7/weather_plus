@@ -8,6 +8,21 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.linear_model import Ridge
 from weather_plus.config import MODEL_DIR
 
+# --- S3 helpers: model artifacts mirrored to S3 ---
+try:
+    from utils.s3_utils import s3_enabled, upload_file
+except Exception:
+    try:
+        from s3_utils import s3_enabled, upload_file  # type: ignore
+    except Exception:
+
+        def s3_enabled() -> bool:
+            return False
+
+        def upload_file(*args, **kwargs):
+            return None
+
+
 os.makedirs(MODEL_DIR, exist_ok=True)
 PT = "data/train_tiles"
 
@@ -107,7 +122,19 @@ FIT = {"reg": fit_reg, "tp2stage": fit_tp_two_stage, "wspd": fit_wspd, "wdir": f
 
 
 def _save(bundle, out):
+    # Local artifact
     joblib.dump(bundle, out, compress=3, protocol=4)
+
+    # Mirror to S3 under WEATHER_S3_PREFIX/<models_subdir>/<filename>
+    if s3_enabled():
+        try:
+            models_subdir = os.path.basename(os.path.normpath(MODEL_DIR)) or "models"
+            upload_file(out, subdir=models_subdir, key=None)
+            print(
+                f"[s3] uploaded model artifact to subdir '{models_subdir}': {os.path.basename(out)}"
+            )
+        except Exception as e:
+            print(f"[s3] WARNING: failed to upload {out} to S3: {e!r}")
 
 
 tiles = sorted(
