@@ -20,6 +20,10 @@
 set -euo pipefail
 export HDF5_USE_FILE_LOCKING=FALSE
 
+# --- Required: point to your S3 bucket/prefix (AWS creds must be configured) ---
+export WEATHER_S3_BUCKET="${WEATHER_S3_BUCKET:-zeus-dataset}"
+export WEATHER_S3_PREFIX="${WEATHER_S3_PREFIX:-weather-plus}"
+
 # -----------------------------
 # Time window (default: 2022-01-01 → "now")
 # -----------------------------
