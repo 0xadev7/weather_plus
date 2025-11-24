@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os, json, glob, argparse, datetime as dt, logging, warnings
+import fsspec
 import numpy as np, pandas as pd, xarray as xr
 
 # I/O layout (unchanged)
@@ -670,6 +671,62 @@ def hybrid_truth(era5_land: xr.Dataset, era5_single: xr.Dataset, key: str, grid,
 
 
 # -------------------------
+# ERA5 manifest + S3 helpers
+# -------------------------
+def _load_json_uri(uri: str):
+    """Load a small JSON file from local disk or a remote URI (e.g. s3://...)."""
+    if isinstance(uri, str) and (uri.startswith("s3://") or "://" in uri):
+        with fsspec.open(uri, "rt") as f:
+            return json.load(f)
+    with open(uri, "r") as f:
+        return json.load(f)
+
+
+def _uris_from_manifest(meta: dict) -> list[str]:
+    """Turn manifest['parts'][*]['key'] into a list of URIs.
+
+    If keys are plain paths, WEATHER_S3_BUCKET / WEATHER_S3_PREFIX are used to
+    construct s3:// URLs; otherwise they are returned as-is.
+    """
+    parts = meta.get("parts") or []
+    keys: list[str] = []
+    for p in parts:
+        k = (p or {}).get("key")
+        if k:
+            keys.append(str(k))
+
+    uris: list[str] = []
+    bucket = os.environ.get("WEATHER_S3_BUCKET")
+    prefix = os.environ.get("WEATHER_S3_PREFIX", "").strip("/")
+    for k in keys:
+        if k.startswith("s3://"):
+            uris.append(k)
+            continue
+        if bucket:
+            # Normalise relative keys under PREFIX when present.
+            if prefix and not k.startswith(prefix + "/"):
+                k_path = f"{prefix}/{k.lstrip('/')}"
+            else:
+                k_path = k.lstrip("/")
+            uris.append(f"s3://{bucket}/{k_path}")
+        else:
+            # Fallback: treat as local path (relative or absolute)
+            uris.append(k)
+    return uris
+
+
+def _open_era5_from_manifest(manifest_uri: str) -> xr.Dataset:
+    """Open an ERA5 dataset by streaming all chunk files listed in a manifest."""
+    meta = _load_json_uri(manifest_uri)
+    uris = _uris_from_manifest(meta)
+    if not uris:
+        raise SystemExit(f"Manifest {manifest_uri!r} contained no 'parts'")
+    log.info(f"[era5] opening {len(uris)} chunks from manifest {manifest_uri}")
+    # Let xarray/fsspec handle remote reads (e.g. s3://...) without touching local disk.
+    return xr.open_mfdataset(uris, combine="by_coords")
+
+
+# -------------------------
 # Feature engineering helpers (new)
 # -------------------------
 def _lags(A: np.ndarray, ks=(1, 3, 6, 24)) -> dict:
@@ -745,6 +802,11 @@ def safe_to_parquet(
                         log.info(
                             f"[parquet] mirrored to S3: train_tiles/{os.path.basename(path)}"
                         )
+                        # In S3-only mode we don't keep a local training file copy.
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
                     except Exception as e:
                         log.warning(f"[parquet] S3 upload failed for {path}: {e!r}")
                 return
@@ -763,6 +825,10 @@ def safe_to_parquet(
                 log.info(
                     f"[parquet] mirrored CSV to S3: train_tiles/{os.path.basename(csv_path)}"
                 )
+                try:
+                    os.remove(csv_path)
+                except Exception:
+                    pass
             except Exception as e:
                 log.warning(f"[parquet] S3 upload failed for {csv_path}: {e!r}")
         if last_err:
@@ -788,8 +854,26 @@ def safe_to_parquet(
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--era5-single", required=True)
-    ap.add_argument("--era5-land", required=True)
+    ap.add_argument(
+        "--era5-single",
+        required=False,
+        help="Path to merged ERA5 single-level NetCDF (local or s3://)",
+    )
+    ap.add_argument(
+        "--era5-land",
+        required=False,
+        help="Path to merged ERA5-Land NetCDF (local or s3://)",
+    )
+    ap.add_argument(
+        "--era5-single-manifest",
+        required=False,
+        help="Manifest JSON (local or s3://) listing ERA5 single-level chunk files",
+    )
+    ap.add_argument(
+        "--era5-land-manifest",
+        required=False,
+        help="Manifest JSON (local or s3://) listing ERA5-Land chunk files",
+    )
     ap.add_argument("--tile-id", required=True)
     ap.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
     ap.add_argument(
@@ -798,12 +882,30 @@ def main():
         help="Ignore manifest and rebuild from all OM JSONs",
     )
     args = ap.parse_args()
+
+    # Require ERA5 inputs either via direct NetCDF paths or via S3 manifest(s).
+    if not args.era5_single and not args.era5_single_manifest:
+        ap.error("one of --era5-single or --era5-single-manifest is required")
+    if not args.era5_land and not args.era5_land_manifest:
+        ap.error("one of --era5-land or --era5-land-manifest is required")
+
     setup_logging(args.log_level)
 
-    log.info(f"Loading ERA5 Single: {args.era5_single}")
-    era5_single = xr.open_dataset(args.era5_single)
-    log.info(f"Loading ERA5-Land:  {args.era5_land}")
-    era5_land = xr.open_dataset(args.era5_land)
+    # Load ERA5 single-levels
+    if args.era5_single_manifest:
+        log.info(f"Loading ERA5 Single from manifest: {args.era5_single_manifest}")
+        era5_single = _open_era5_from_manifest(args.era5_single_manifest)
+    else:
+        log.info(f"Loading ERA5 Single: {args.era5_single}")
+        era5_single = xr.open_dataset(args.era5_single)
+
+    # Load ERA5-Land
+    if args.era5_land_manifest:
+        log.info(f"Loading ERA5-Land from manifest: {args.era5_land_manifest}")
+        era5_land = _open_era5_from_manifest(args.era5_land_manifest)
+    else:
+        log.info(f"Loading ERA5-Land:  {args.era5_land}")
+        era5_land = xr.open_dataset(args.era5_land)
 
     # Rows per target (same keys as before)
     rows = {k: [] for k in ["t2m", "td2m", "psfc", "tp", "wspd100", "wdir100"]}

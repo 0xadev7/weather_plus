@@ -132,6 +132,19 @@ PY
 
 have_era5_files() {
     local tile="$1"
+    
+    # Prefer S3 manifests if AWS CLI and bucket/prefix are available.
+    if command -v aws >/dev/null 2>&1 && [[ -n "${WEATHER_S3_BUCKET:-}" && -n "${WEATHER_S3_PREFIX:-}" ]]; then
+        local single_manifest="s3://${WEATHER_S3_BUCKET}/${WEATHER_S3_PREFIX}/manifests/era5-single/${tile}_era5_single.manifest.json"
+        local land_manifest="s3://${WEATHER_S3_BUCKET}/${WEATHER_S3_PREFIX}/manifests/era5-land/${tile}_era5_land.manifest.json"
+        if aws s3 ls "$single_manifest" >/dev/null 2>&1 && aws s3 ls "$land_manifest" >/dev/null 2>&1; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    
+    # Fallback to local NetCDF tiles (legacy behaviour)
     [[ -s "${OUT_TILE_DIR}/${tile}_era5_single.nc" && -s "${OUT_TILE_DIR}/${tile}_era5_land.nc" ]]
 }
 have_pairs_done() { local tile="$1"; [[ -s "${OUT_TILE_DIR}/${tile}.pairs.done" ]]; }
@@ -204,7 +217,7 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
                 
                 run_logged \
                 "python \"$ERA5_LAND_SCRIPT\" \
-                --lat-min \"$LAT_MIN\" --lat-max \"$LON_MIN\" \
+                --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
                 --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
                 --start \"$START\" --end \"$END\" \
                 --debug-merge \
@@ -216,14 +229,19 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
             
             # ------------------- Pairing (OM→features, ERA5→target) -------------------
             if ! have_pairs_done "$TILE"; then
+                # Use S3-hosted ERA5 manifests; pairing code will stream NetCDF parts from S3.
+                S3_SINGLE_MANIFEST="s3://${WEATHER_S3_BUCKET}/${WEATHER_S3_PREFIX}/manifests/era5-single/${TILE}_era5_single.manifest.json"
+                S3_LAND_MANIFEST="s3://${WEATHER_S3_BUCKET}/${WEATHER_S3_PREFIX}/manifests/era5-land/${TILE}_era5_land.manifest.json"
+                
                 run_logged \
                 "python \"$PAIR_SCRIPT\" \
-                --era5-single \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\" \
-                --era5-land   \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\" \
-                --tile-id     \"$TILE\"" \
+                --era5-single-manifest \"$S3_SINGLE_MANIFEST\" \
+                --era5-land-manifest   \"$S3_LAND_MANIFEST\" \
+                --tile-id              \"$TILE\"" \
                 "logs/${TILE}_pair.log"
                 : > "${OUT_TILE_DIR}/${TILE}.pairs.done"
                 if [[ "$CLEAN_INTERMEDIATES" == "1" ]]; then
+                    # Left here for backwards-compat; in S3-only mode these files won't exist.
                     rm -f "${OUT_TILE_DIR}/${TILE}_era5_single.nc" "${OUT_TILE_DIR}/${TILE}_era5_land.nc" || true
                 fi
             else
