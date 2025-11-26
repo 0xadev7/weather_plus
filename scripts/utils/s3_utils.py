@@ -209,3 +209,34 @@ def list_objects(subdir: str, prefix: str = "", suffix: str = "") -> list[str]:
                 continue
             uris.append(f"s3://{bucket}/{key}")
     return uris
+
+
+def list_object_keys(subdir: str, prefix: str = "", suffix: str = "") -> list[str]:
+    """
+    List object keys (relative to WEATHER_S3_PREFIX/<subdir>/) matching prefix/suffix.
+    Returns list of relative keys (not full S3 URIs).
+    """
+    if not s3_enabled():
+        return []
+    
+    bucket, base = _bucket_and_prefix()
+    cli = _client()
+    s3_prefix = _join_key(base, subdir) + "/"
+    
+    keys = []
+    paginator = cli.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=s3_prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            # Remove the base prefix to get relative key
+            if key.startswith(base + "/"):
+                rel_key = key[len(base) + 1:]
+            else:
+                rel_key = key
+            name = os.path.basename(key)
+            if prefix and not name.startswith(prefix):
+                continue
+            if suffix and not name.endswith(suffix):
+                continue
+            keys.append(rel_key)
+    return keys

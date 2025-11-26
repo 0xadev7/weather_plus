@@ -166,9 +166,9 @@ def try_retrieve(
 import tempfile, json, shutil
 
 try:
-    from utils.s3_utils import s3_enabled, upload_file, upload_bytes, object_exists, download_json
+    from utils.s3_utils import s3_enabled, upload_file, upload_bytes, object_exists, download_json, list_object_keys
 except Exception:
-    from s3_utils import s3_enabled, upload_file, upload_bytes, object_exists, download_json  # type: ignore
+    from s3_utils import s3_enabled, upload_file, upload_bytes, object_exists, download_json, list_object_keys  # type: ignore
 
 ZIP_MAGIC = b"PK\x03\x04"
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
@@ -307,7 +307,35 @@ def main():
                     existing_parts = {}
                     manifest_parts = []
             else:
+                # Manifest doesn't exist - scan S3 for existing part files to resume
+                log(f"[info] manifest not found, scanning S3 for existing parts...")
                 manifest_parts = []
+                existing_parts = {}
+                
+                # Get the base name pattern for parts
+                base_pattern = os.path.splitext(os.path.basename(args.outfile))[0]
+                part_prefix = f"{base_pattern}.part_"
+                
+                # List all existing part files in the subdir
+                existing_keys = list_object_keys(subdir, prefix=part_prefix)
+                log(f"[info] found {len(existing_keys)} existing part files on S3")
+                
+                # Parse tags from existing files and add to manifest_parts
+                for key in existing_keys:
+                    # Extract tag from filename like "TILE_era5_land.part_202201.nc" -> "202201"
+                    name = os.path.basename(key)
+                    if ".part_" in name:
+                        # Try to extract tag (could be month YYYYMM or day YYYYMMDD)
+                        tag_part = name.split(".part_")[1]
+                        # Remove extension
+                        tag = os.path.splitext(tag_part)[0]
+                        if tag:
+                            existing_parts[tag] = key
+                            manifest_parts.append({"tag": tag, "key": key})
+                            log(f"[resume] found existing part: {tag} -> {key}")
+                
+                if existing_parts:
+                    log(f"[resume] resuming with {len(existing_parts)} existing parts from S3")
             
             for am, bm, tagm in chunks:
                 # Decide to request month or split into days
@@ -365,6 +393,7 @@ def main():
                             # Add to manifest if not already there
                             key = f"{subdir}/{up_name}"
                             if tagd not in existing_parts:
+                                existing_parts[tagd] = key
                                 manifest_parts.append({"tag": tagd, "key": key})
                             os.remove(tmp_target)
                         else:
@@ -386,6 +415,7 @@ def main():
                         # Add to manifest if not already there
                         key = f"{subdir}/{up_name}"
                         if tagm not in existing_parts:
+                            existing_parts[tagm] = key
                             manifest_parts.append({"tag": tagm, "key": key})
                         os.remove(tmp_target)
                     else:
