@@ -25,6 +25,12 @@ export WEATHER_S3_BUCKET="${WEATHER_S3_BUCKET:-zeus-dataset}"
 export WEATHER_S3_PREFIX="${WEATHER_S3_PREFIX:-weather-plus}"
 
 # -----------------------------
+# Helper functions (must be defined before use)
+# -----------------------------
+ts() { date +"%Y-%m-%d %H:%M:%S"; }
+log() { echo "[$(ts)] $*"; }
+
+# -----------------------------
 # Time window for data fetch and training
 # -----------------------------
 # Default START: 2022-01-01 (ERA5 data available from this date)
@@ -98,9 +104,6 @@ OUT_OM_DIR="data/om_baseline"
 OUT_TILE_DIR="tiles"
 OUT_PAIR_DIR="data/train_tiles"
 mkdir -p "$OUT_OM_DIR" "$OUT_TILE_DIR" "$OUT_PAIR_DIR" logs
-
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
-log() { echo "[$(ts)] $*"; }
 
 run_logged() {
     local cmd="$1"
