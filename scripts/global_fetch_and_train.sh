@@ -25,14 +25,33 @@ export WEATHER_S3_BUCKET="${WEATHER_S3_BUCKET:-zeus-dataset}"
 export WEATHER_S3_PREFIX="${WEATHER_S3_PREFIX:-weather-plus}"
 
 # -----------------------------
-# Time window (default: 2022-01-01 → "now")
+# Time window for data fetch and training
 # -----------------------------
-START="${START:-2022-01-01T00:00}"
+# Default START: 2022-01-01 (ERA5 data available from this date)
+# Default END: 3 months before current date (ERA5-Land has ~3 month delay)
+# 
+# For initial bulk fetch (2022-2025), you can override:
+#   export START="2022-01-01T00:00"
+#   export END="2024-09-30T23:00"  # 3 months before late 2024
+#
+# For ongoing monthly retraining, use train_monthly.sh which computes
+# conservative dates automatically (END = 3 months ago, START = END - 24 months)
 
-# If END not provided, default to current UTC hour
-if [[ -z "${END:-}" ]]; then
-    END="$(date -u +%Y-%m-%dT%H:00)"
+if [[ -z "${START:-}" ]]; then
+    START="2022-01-01T00:00"
 fi
+
+if [[ -z "${END:-}" ]]; then
+    # Default to 3 months before current date (ERA5-Land availability)
+    # This ensures we only fetch data that's definitely available
+    END_DATE="$(date -u -d "$(date -u +%Y-%m-01) -3 month -1 day" +%Y-%m-%d)"
+    END="${END_DATE}T23:00"
+    log "[info] END not set, using conservative default: ${END} (3 months before today)"
+else
+    log "[info] Using provided END: ${END}"
+fi
+
+log "[info] Data fetch window: ${START} → ${END}"
 
 CHUNK_HOURS="${CHUNK_HOURS:-168}"   # OM batch window
 
@@ -221,34 +240,33 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         
         # ------------------- ERA5 (targets) -------------------
         if [[ "$OM_ONLY" != "1" ]]; then
-            if ! have_era5_files "$TILE"; then
-                # Build ERA5 single command with optional S3 flag
-                ERA5_SINGLE_CMD="python \"$ERA5_SINGLE_SCRIPT\" \
-                --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
-                --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
-                --start \"$START\" --end \"$END\" \
-                --debug-merge \
-                --outfile \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\""
-                
-                # Build ERA5 land command with optional S3 flag
-                ERA5_LAND_CMD="python \"$ERA5_LAND_SCRIPT\" \
-                --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
-                --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
-                --start \"$START\" --end \"$END\" \
-                --debug-merge \
-                --outfile \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\""
-                
-                # Add S3 flag if bucket is configured
-                if [[ -n "${WEATHER_S3_BUCKET:-}" ]]; then
-                    ERA5_SINGLE_CMD="$ERA5_SINGLE_CMD --to-s3"
-                    ERA5_LAND_CMD="$ERA5_LAND_CMD --to-s3"
-                fi
-                
-                run_logged "$ERA5_SINGLE_CMD" "logs/${TILE}_era5_single.log"
-                run_logged "$ERA5_LAND_CMD" "logs/${TILE}_era5_land.log"
-            else
-                log "[era5] already fetched for $TILE"
+            # Always call ERA5 fetch scripts - they will check for existing data
+            # and only download missing parts. This allows incremental updates
+            # when train_monthly.sh runs with a sliding window.
+            # Build ERA5 single command with optional S3 flag
+            ERA5_SINGLE_CMD="python \"$ERA5_SINGLE_SCRIPT\" \
+            --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
+            --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
+            --start \"$START\" --end \"$END\" \
+            --debug-merge \
+            --outfile \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\""
+            
+            # Build ERA5 land command with optional S3 flag
+            ERA5_LAND_CMD="python \"$ERA5_LAND_SCRIPT\" \
+            --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
+            --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
+            --start \"$START\" --end \"$END\" \
+            --debug-merge \
+            --outfile \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\""
+            
+            # Add S3 flag if bucket is configured
+            if [[ -n "${WEATHER_S3_BUCKET:-}" ]]; then
+                ERA5_SINGLE_CMD="$ERA5_SINGLE_CMD --to-s3"
+                ERA5_LAND_CMD="$ERA5_LAND_CMD --to-s3"
             fi
+            
+            run_logged "$ERA5_SINGLE_CMD" "logs/${TILE}_era5_single.log"
+            run_logged "$ERA5_LAND_CMD" "logs/${TILE}_era5_land.log"
             
             # ------------------- Pairing (OM→features, ERA5→target) -------------------
             if ! have_pairs_done "$TILE"; then
