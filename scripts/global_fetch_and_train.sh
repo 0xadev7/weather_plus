@@ -133,15 +133,25 @@ PY
 have_era5_files() {
     local tile="$1"
     
-    # Prefer S3 manifests if AWS CLI and bucket/prefix are available.
-    if command -v aws >/dev/null 2>&1 && [[ -n "${WEATHER_S3_BUCKET:-}" && -n "${WEATHER_S3_PREFIX:-}" ]]; then
-        local single_manifest="s3://${WEATHER_S3_BUCKET}/${WEATHER_S3_PREFIX}/manifests/era5-single/${tile}_era5_single.manifest.json"
-        local land_manifest="s3://${WEATHER_S3_BUCKET}/${WEATHER_S3_PREFIX}/manifests/era5-land/${tile}_era5_land.manifest.json"
-        if aws s3 ls "$single_manifest" >/dev/null 2>&1 && aws s3 ls "$land_manifest" >/dev/null 2>&1; then
-            return 0
-        else
-            return 1
-        fi
+    # Use Python/boto3 to check S3 manifests if S3 is enabled
+    if [[ -n "${WEATHER_S3_BUCKET:-}" && -n "${WEATHER_S3_PREFIX:-}" ]]; then
+        python - <<PY
+import os, sys
+os.environ.setdefault("WEATHER_S3_BUCKET", "${WEATHER_S3_BUCKET}")
+os.environ.setdefault("WEATHER_S3_PREFIX", "${WEATHER_S3_PREFIX}")
+try:
+    from utils.s3_utils import object_exists
+    single_exists = object_exists("manifests/era5-single", "${tile}_era5_single.manifest.json")
+    land_exists = object_exists("manifests/era5-land", "${tile}_era5_land.manifest.json")
+    sys.exit(0 if (single_exists and land_exists) else 1)
+except Exception as e:
+    # Fallback: check local files
+    import os.path
+    single_local = os.path.exists("${OUT_TILE_DIR}/${tile}_era5_single.nc") and os.path.getsize("${OUT_TILE_DIR}/${tile}_era5_single.nc") > 0
+    land_local = os.path.exists("${OUT_TILE_DIR}/${tile}_era5_land.nc") and os.path.getsize("${OUT_TILE_DIR}/${tile}_era5_land.nc") > 0
+    sys.exit(0 if (single_local and land_local) else 1)
+PY
+        return $?
     fi
     
     # Fallback to local NetCDF tiles (legacy behaviour)
@@ -187,8 +197,8 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         
         # ------------------- Open-Meteo (features) -------------------
         if [[ "$ERA5_ONLY" != "1" ]]; then
-            run_logged \
-            "python \"$OM_FETCH_SCRIPT\" \
+            # Build command with optional S3 flag
+            OM_CMD="python \"$OM_FETCH_SCRIPT\" \
             --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
             --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
             --lat-steps \"$LAT_STEPS\" --lon-steps \"$LON_STEPS\" \
@@ -197,8 +207,14 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
             --max-locs \"$OM_MAX_LOCS\" \
             --rps \"$OM_RPS\" \
             --retries-429 \"$OM_RETRIES_429\" \
-            --timeout \"$OM_TIMEOUT\"" \
-            "logs/${TILE}_om.log"
+            --timeout \"$OM_TIMEOUT\""
+            
+            # Add S3 flag if bucket is configured
+            if [[ -n "${WEATHER_S3_BUCKET:-}" ]]; then
+                OM_CMD="$OM_CMD --to-s3"
+            fi
+            
+            run_logged "$OM_CMD" "logs/${TILE}_om.log"
         else
             log "[om] skipped (ERA5_ONLY=1)"
         fi
@@ -206,23 +222,30 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         # ------------------- ERA5 (targets) -------------------
         if [[ "$OM_ONLY" != "1" ]]; then
             if ! have_era5_files "$TILE"; then
-                run_logged \
-                "python \"$ERA5_SINGLE_SCRIPT\" \
+                # Build ERA5 single command with optional S3 flag
+                ERA5_SINGLE_CMD="python \"$ERA5_SINGLE_SCRIPT\" \
                 --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
                 --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
                 --start \"$START\" --end \"$END\" \
                 --debug-merge \
-                --outfile \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\"" \
-                "logs/${TILE}_era5_single.log"
+                --outfile \"${OUT_TILE_DIR}/${TILE}_era5_single.nc\""
                 
-                run_logged \
-                "python \"$ERA5_LAND_SCRIPT\" \
+                # Build ERA5 land command with optional S3 flag
+                ERA5_LAND_CMD="python \"$ERA5_LAND_SCRIPT\" \
                 --lat-min \"$LAT_MIN\" --lat-max \"$LAT_MAX\" \
                 --lon-min \"$LON_MIN\" --lon-max \"$LON_MAX\" \
                 --start \"$START\" --end \"$END\" \
                 --debug-merge \
-                --outfile \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\"" \
-                "logs/${TILE}_era5_land.log"
+                --outfile \"${OUT_TILE_DIR}/${TILE}_era5_land.nc\""
+                
+                # Add S3 flag if bucket is configured
+                if [[ -n "${WEATHER_S3_BUCKET:-}" ]]; then
+                    ERA5_SINGLE_CMD="$ERA5_SINGLE_CMD --to-s3"
+                    ERA5_LAND_CMD="$ERA5_LAND_CMD --to-s3"
+                fi
+                
+                run_logged "$ERA5_SINGLE_CMD" "logs/${TILE}_era5_single.log"
+                run_logged "$ERA5_LAND_CMD" "logs/${TILE}_era5_land.log"
             else
                 log "[era5] already fetched for $TILE"
             fi

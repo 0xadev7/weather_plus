@@ -12,10 +12,10 @@ log = logging.getLogger("make_pairs_plus")
 
 # --- S3 helpers for mirroring parquet files ---
 try:
-    from utils.s3_utils import s3_enabled, upload_file
+    from utils.s3_utils import s3_enabled, upload_file, list_objects
 except Exception:
     try:
-        from s3_utils import s3_enabled, upload_file  # type: ignore
+        from s3_utils import s3_enabled, upload_file, list_objects  # type: ignore
     except Exception:
 
         def s3_enabled() -> bool:
@@ -23,6 +23,9 @@ except Exception:
 
         def upload_file(*args, **kwargs):
             return None
+        
+        def list_objects(*args, **kwargs):
+            return []
 
 
 # -------------------------
@@ -910,9 +913,34 @@ def main():
     # Rows per target (same keys as before)
     rows = {k: [] for k in ["t2m", "td2m", "psfc", "tp", "wspd100", "wdir100"]}
 
-    files = sorted(glob.glob(os.path.join(OM_DIR, "omifs_*.json")))
+    # Collect OM files from local directory and/or S3
+    files = []
+    file_sources = {}  # Map filename -> (source_type, path_or_uri)
+    
+    # First, check local directory
+    local_files = sorted(glob.glob(os.path.join(OM_DIR, "omifs_*.json")))
+    for p in local_files:
+        base = os.path.basename(p)
+        files.append(p)
+        file_sources[base] = ("local", p)
+    
+    # Then, check S3 if enabled
+    if s3_enabled():
+        try:
+            s3_files = list_objects("om_baseline", prefix="omifs_", suffix=".json")
+            for s3_uri in s3_files:
+                name = os.path.basename(s3_uri)
+                # Only add if not already in local files
+                if name not in file_sources:
+                    files.append(s3_uri)
+                    file_sources[name] = ("s3", s3_uri)
+        except Exception as e:
+            log.warning(f"[pair] could not list S3 OM files: {e}, using local only")
+    
     if not files:
-        raise SystemExit("No OM baseline files found")
+        raise SystemExit("No OM baseline files found (checked local and S3)")
+    
+    log.info(f"[pair] found {len(files)} OM files ({len([f for f in file_sources.values() if f[0]=='s3'])} from S3, {len([f for f in file_sources.values() if f[0]=='local'])} local)")
 
     processed = set() if args.force else _load_processed(args.tile_id)
     new_processed: list[str] = []
@@ -932,8 +960,12 @@ def main():
             log.info(f"[pair] skip already processed: {base}")
             continue
         try:
-            with open(p, "r") as f:
-                j = json.load(f)
+            # Load from local file or S3 URI
+            if isinstance(p, str) and (p.startswith("s3://") or "://" in p):
+                j = _load_json_uri(p)
+            else:
+                with open(p, "r") as f:
+                    j = json.load(f)
         except Exception as e:
             log.warning(f"[pair] skip {base} (invalid JSON: {e})")
             continue

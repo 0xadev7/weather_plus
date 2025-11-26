@@ -161,3 +161,51 @@ def download_subdir_to(
             dest = os.path.join(local_dir, name)
             if not os.path.exists(dest):
                 cli.download_file(bucket, key, dest)
+
+
+def download_json(subdir: str, name: str) -> Optional[dict]:
+    """
+    Download a JSON file from S3 and return it as a dict.
+    Returns None if the file doesn't exist or S3 is disabled.
+    """
+    if not s3_enabled():
+        return None
+    
+    import json
+    bucket, base = _bucket_and_prefix()
+    key = _join_key(base, subdir, name)
+    cli = _client()
+    try:
+        resp = cli.get_object(Bucket=bucket, Key=key)
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+
+def list_objects(subdir: str, prefix: str = "", suffix: str = "") -> list[str]:
+    """
+    List object keys under WEATHER_S3_PREFIX/<subdir>/ matching prefix/suffix.
+    Returns list of full S3 URIs (s3://bucket/key).
+    """
+    if not s3_enabled():
+        return []
+    
+    bucket, base = _bucket_and_prefix()
+    cli = _client()
+    s3_prefix = _join_key(base, subdir) + "/"
+    
+    uris = []
+    paginator = cli.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=s3_prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            name = os.path.basename(key)
+            if prefix and not name.startswith(prefix):
+                continue
+            if suffix and not name.endswith(suffix):
+                continue
+            uris.append(f"s3://{bucket}/{key}")
+    return uris

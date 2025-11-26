@@ -166,9 +166,9 @@ def try_retrieve(
 import tempfile, json, shutil
 
 try:
-    from utils.s3_utils import s3_enabled, upload_file, upload_bytes, object_exists
+    from utils.s3_utils import s3_enabled, upload_file, upload_bytes, object_exists, download_json
 except Exception:
-    from s3_utils import s3_enabled, upload_file, upload_bytes, object_exists  # type: ignore
+    from s3_utils import s3_enabled, upload_file, upload_bytes, object_exists, download_json  # type: ignore
 
 ZIP_MAGIC = b"PK\x03\x04"
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
@@ -262,10 +262,53 @@ def main():
     chunks = months_between(t0, t1)
 
     if use_s3:
+        # Check if manifest already exists
+        mname = _manifest_name(args.outfile)
+        manifest_exists = object_exists("manifests/era5-land", mname)
+        
+        if manifest_exists:
+            log(f"[skip] manifest already exists: manifests/era5-land/{mname}")
+            # Load existing manifest to check if we need to download any missing parts
+            existing_meta = download_json("manifests/era5-land", mname)
+            if existing_meta:
+                existing_parts = {p.get("tag"): p.get("key") for p in existing_meta.get("parts", [])}
+                log(f"[info] existing manifest has {len(existing_parts)} parts")
+                
+                # Check if all required chunks are present
+                required_tags = set()
+                for am, bm, tagm in chunks:
+                    required_tags.add(tagm)
+                    # If month fails, we'll need day tags
+                    for ad, bd, tagd in days_between(am, bm):
+                        required_tags.add(tagd)
+                
+                missing_tags = required_tags - set(existing_parts.keys())
+                if not missing_tags:
+                    log(f"[skip] all required parts already exist in manifest")
+                    return
+                log(f"[info] need to download {len(missing_tags)} missing parts")
+            else:
+                log(f"[warn] could not load existing manifest, will re-download")
+                manifest_exists = False
+        
         import tempfile
 
         tempdir = tempfile.mkdtemp(prefix="era5_land_dl_")
         try:
+            # Load existing manifest if it exists to avoid re-downloading parts
+            existing_parts = {}
+            if manifest_exists:
+                existing_meta = download_json("manifests/era5-land", mname)
+                if existing_meta:
+                    existing_parts = {p.get("tag"): p.get("key") for p in existing_meta.get("parts", [])}
+                    manifest_parts = existing_meta.get("parts", [])[:]  # Copy existing parts
+                else:
+                    log(f"[warn] could not load existing manifest, starting fresh")
+                    existing_parts = {}
+                    manifest_parts = []
+            else:
+                manifest_parts = []
+            
             for am, bm, tagm in chunks:
                 # Decide to request month or split into days
                 tag = tagm
@@ -313,8 +356,16 @@ def main():
                             sys.exit(2)
                         ext = _detect_ext(tmp_target)
                         up_name = base_name + ext
-                        if object_exists(subdir, up_name):
+                        # Check if this part already exists (either in existing manifest or on S3)
+                        if tagd in existing_parts:
+                            log(f"[skip] part {tagd} already in manifest")
+                            os.remove(tmp_target)
+                        elif object_exists(subdir, up_name):
                             log(f"[skip] exists s3://.../{subdir}/{up_name}")
+                            # Add to manifest if not already there
+                            key = f"{subdir}/{up_name}"
+                            if tagd not in existing_parts:
+                                manifest_parts.append({"tag": tagd, "key": key})
                             os.remove(tmp_target)
                         else:
                             key = upload_file(tmp_target, subdir=subdir, key=None)
@@ -326,8 +377,16 @@ def main():
                 if ok:
                     ext = _detect_ext(tmp_target)
                     up_name = base_name + ext
-                    if object_exists(subdir, up_name):
+                    # Check if this part already exists (either in existing manifest or on S3)
+                    if tagm in existing_parts:
+                        log(f"[skip] part {tagm} already in manifest")
+                        os.remove(tmp_target)
+                    elif object_exists(subdir, up_name):
                         log(f"[skip] exists s3://.../{subdir}/{up_name}")
+                        # Add to manifest if not already there
+                        key = f"{subdir}/{up_name}"
+                        if tagm not in existing_parts:
+                            manifest_parts.append({"tag": tagm, "key": key})
                         os.remove(tmp_target)
                     else:
                         key = upload_file(tmp_target, subdir=subdir, key=None)
@@ -338,24 +397,25 @@ def main():
                     log(f"error: {err}")
                     sys.exit(2)
 
-            # Emit manifest
-            meta = {
-                "dataset": "reanalysis-era5-land",
-                "tile_id": tile_id,
-                "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],
-                "start": args.start,
-                "end": args.end,
-                "variables": variables,
-                "parts": manifest_parts,
-            }
-            mname = _manifest_name(args.outfile)
-            mkey = upload_bytes(
-                json.dumps(meta).encode("utf-8"),
-                subdir="manifests/era5-land",
-                name=mname,
-                content_type="application/json",
-            )
-            print(f"[manifest] s3://.../{mkey}")
+            # Emit/update manifest (only if we have parts)
+            if manifest_parts:
+                meta = {
+                    "dataset": "reanalysis-era5-land",
+                    "tile_id": tile_id,
+                    "area": [args.lat_max, args.lon_min, args.lat_min, args.lon_max],
+                    "start": args.start,
+                    "end": args.end,
+                    "variables": variables,
+                    "parts": manifest_parts,
+                }
+                mname = _manifest_name(args.outfile)
+                mkey = upload_bytes(
+                    json.dumps(meta).encode("utf-8"),
+                    subdir="manifests/era5-land",
+                    name=mname,
+                    content_type="application/json",
+                )
+                print(f"[manifest] s3://.../{mkey}")
         finally:
             try:
                 os.rmdir(tempdir)
