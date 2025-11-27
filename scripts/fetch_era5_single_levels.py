@@ -332,12 +332,28 @@ def main():
                     log(f"[resume] resuming with {len(existing_parts)} existing parts from S3")
             
             for am, bm, tagm in chunks:
+                # Check if month part already exists BEFORE downloading
                 tag = tagm
                 base_name = (
                     os.path.splitext(os.path.basename(args.outfile))[0] + f".part_{tag}"
                 )
+                ext = ".nc"  # Default extension
+                up_name = base_name + ext
+                
+                # Check if this month part already exists
+                if tagm in existing_parts:
+                    log(f"[skip] month {tagm} already in manifest")
+                    continue
+                elif object_exists(subdir, up_name):
+                    log(f"[skip] month {tagm} exists on S3: {subdir}/{up_name}")
+                    # Add to manifest if not already there
+                    key = f"{subdir}/{up_name}"
+                    existing_parts[tagm] = key
+                    manifest_parts.append({"tag": tagm, "key": key})
+                    continue
+                
+                # Month doesn't exist, try to download it
                 tmp_target = os.path.join(tempdir, base_name + ".nc")
-
                 req = build_request(am, bm, args)
                 log(
                     f"request month {tagm}  area(N,W,S,E)=({args.lat_max},{args.lon_min},{args.lat_min},{args.lon_max})"
@@ -353,11 +369,27 @@ def main():
                 if not ok and (err == "cost" or args.granularity in ("auto",)):
                     log("month too large; splitting into days…")
                     for ad, bd, tagd in days_between(am, bm):
+                        # Check if day part already exists BEFORE downloading
                         tag = tagd
                         base_name = (
                             os.path.splitext(os.path.basename(args.outfile))[0]
                             + f".part_{tag}"
                         )
+                        ext = ".nc"
+                        up_name = base_name + ext
+                        
+                        if tagd in existing_parts:
+                            log(f"[skip] day {tagd} already in manifest")
+                            continue
+                        elif object_exists(subdir, up_name):
+                            log(f"[skip] day {tagd} exists on S3: {subdir}/{up_name}")
+                            # Add to manifest if not already there
+                            key = f"{subdir}/{up_name}"
+                            existing_parts[tagd] = key
+                            manifest_parts.append({"tag": tagd, "key": key})
+                            continue
+                        
+                        # Day doesn't exist, download it
                         tmp_target = os.path.join(tempdir, base_name + ".nc")
                         reqd = build_request(ad, bd, args)
                         log(f"request day {tagd}")
@@ -379,45 +411,21 @@ def main():
                             sys.exit(2)
                         ext = _detect_ext(tmp_target)
                         up_name = base_name + ext
-                        # Check if this part already exists (either in existing manifest or on S3)
-                        if tagd in existing_parts:
-                            log(f"[skip] part {tagd} already in manifest")
-                            os.remove(tmp_target)
-                        elif object_exists(subdir, up_name):
-                            log(f"[skip] exists s3://.../{subdir}/{up_name}")
-                            # Add to manifest if not already there
-                            key = f"{subdir}/{up_name}"
-                            if tagd not in existing_parts:
-                                existing_parts[tagd] = key
-                                manifest_parts.append({"tag": tagd, "key": key})
-                            os.remove(tmp_target)
-                        else:
-                            key = upload_file(tmp_target, subdir=subdir, key=None)
-                            log(f"[ok] uploaded s3://.../{key}")
-                            manifest_parts.append({"tag": tagd, "key": key})
-                            os.remove(tmp_target)
+                        key = upload_file(tmp_target, subdir=subdir, key=None)
+                        log(f"[ok] uploaded s3://.../{key}")
+                        existing_parts[tagd] = key
+                        manifest_parts.append({"tag": tagd, "key": key})
+                        os.remove(tmp_target)
                     continue
 
                 if ok:
                     ext = _detect_ext(tmp_target)
                     up_name = base_name + ext
-                    # Check if this part already exists (either in existing manifest or on S3)
-                    if tagm in existing_parts:
-                        log(f"[skip] part {tagm} already in manifest")
-                        os.remove(tmp_target)
-                    elif object_exists(subdir, up_name):
-                        log(f"[skip] exists s3://.../{subdir}/{up_name}")
-                        # Add to manifest if not already there
-                        key = f"{subdir}/{up_name}"
-                        if tagm not in existing_parts:
-                            existing_parts[tagm] = key
-                            manifest_parts.append({"tag": tagm, "key": key})
-                        os.remove(tmp_target)
-                    else:
-                        key = upload_file(tmp_target, subdir=subdir, key=None)
-                        log(f"[ok] uploaded s3://.../{key}")
-                        manifest_parts.append({"tag": tagm, "key": key})
-                        os.remove(tmp_target)
+                    key = upload_file(tmp_target, subdir=subdir, key=None)
+                    log(f"[ok] uploaded s3://.../{key}")
+                    existing_parts[tagm] = key
+                    manifest_parts.append({"tag": tagm, "key": key})
+                    os.remove(tmp_target)
                 else:
                     log(f"error: {err}")
                     sys.exit(2)
