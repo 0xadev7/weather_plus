@@ -751,16 +751,51 @@ def _open_era5_from_manifest(manifest_uri: str) -> xr.Dataset:
     if not uris:
         raise SystemExit(f"Manifest {manifest_uri!r} contained no 'parts'")
     log.info(f"[era5] opening {len(uris)} chunks from manifest {manifest_uri}")
-    # Let xarray/fsspec handle remote reads (e.g. s3://...) without touching local disk.
-    # Note: Requires s3fs to be installed for S3 support
-    try:
-        return xr.open_mfdataset(uris, combine="by_coords")
-    except ImportError as e:
-        if "s3fs" in str(e).lower() or "s3" in str(e).lower():
+    
+    # Check if any URIs are S3 URIs
+    has_s3 = any(uri.startswith("s3://") for uri in uris)
+    
+    if has_s3:
+        # For S3 URIs, we need to use s3fs explicitly
+        try:
+            import s3fs
+        except ImportError:
             raise ImportError(
                 "s3fs is required for reading S3 files. Install it with: pip install s3fs"
-            ) from e
-        raise
+            )
+        
+        # Create s3fs filesystem with default credentials
+        fs = s3fs.S3FileSystem()
+        
+        # Open files using s3fs file handles - xarray can read from these
+        # Use engine='h5netcdf' which has better S3 support via s3fs
+        log.info(f"[era5] using s3fs to open {len(uris)} S3 files")
+        try:
+            # Open files with s3fs and pass to xarray
+            # h5netcdf works better with s3fs file handles
+            file_handles = [fs.open(uri, "rb") for uri in uris]
+            return xr.open_mfdataset(
+                file_handles,
+                combine="by_coords",
+                engine="h5netcdf"
+            )
+        except Exception as e:
+            log.warning(f"[era5] h5netcdf failed, trying netcdf4: {e}")
+            # Fallback: close h5netcdf handles and try netcdf4
+            for fh in file_handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            file_handles = [fs.open(uri, "rb") for uri in uris]
+            return xr.open_mfdataset(
+                file_handles,
+                combine="by_coords",
+                engine="netcdf4"
+            )
+    else:
+        # Local files - use standard approach
+        return xr.open_mfdataset(uris, combine="by_coords")
 
 
 # -------------------------
