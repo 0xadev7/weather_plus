@@ -2,6 +2,9 @@
 import os, json, glob, argparse, datetime as dt, logging, warnings
 import fsspec
 import numpy as np, pandas as pd, xarray as xr
+import zipfile
+import tempfile
+import shutil
 
 # I/O layout (unchanged)
 OM_DIR = os.path.join("data", "om_baseline")
@@ -756,43 +759,76 @@ def _open_era5_from_manifest(manifest_uri: str) -> xr.Dataset:
     has_s3 = any(uri.startswith("s3://") for uri in uris)
     
     if has_s3:
-        # For S3 URIs, we need to use s3fs explicitly
+        # For S3 URIs, download to temp directory and open locally
+        # This is more reliable than trying to stream from S3 with netCDF4
         try:
             import s3fs
+            import tempfile
+            import shutil
+            import zipfile
         except ImportError:
             raise ImportError(
-                "s3fs is required for reading S3 files. Install it with: pip install s3fs"
+                "s3fs is required for reading S3 files. Install with: pip install s3fs"
             )
         
-        # Create s3fs filesystem with default credentials
         fs = s3fs.S3FileSystem()
+        temp_dir = tempfile.mkdtemp(prefix="era5_temp_")
         
-        # Open files using s3fs file handles - xarray can read from these
-        # Use engine='h5netcdf' which has better S3 support via s3fs
-        log.info(f"[era5] using s3fs to open {len(uris)} S3 files")
         try:
-            # Open files with s3fs and pass to xarray
-            # h5netcdf works better with s3fs file handles
-            file_handles = [fs.open(uri, "rb") for uri in uris]
-            return xr.open_mfdataset(
-                file_handles,
-                combine="by_coords",
-                engine="h5netcdf"
-            )
-        except Exception as e:
-            log.warning(f"[era5] h5netcdf failed, trying netcdf4: {e}")
-            # Fallback: close h5netcdf handles and try netcdf4
-            for fh in file_handles:
+            log.info(f"[era5] downloading {len(uris)} files from S3 to temp directory")
+            local_paths = []
+            
+            for i, uri in enumerate(uris):
+                # Determine local filename
+                base_name = os.path.basename(uri)
+                # Remove .nc extension if present, we'll detect the actual format
+                if base_name.endswith(".nc"):
+                    base_name = base_name[:-3]
+                local_path = os.path.join(temp_dir, f"chunk_{i}_{base_name}")
+                
+                # Download from S3
+                fs.get(uri, local_path)
+                
+                # Check if it's a ZIP file and extract if needed
                 try:
-                    fh.close()
-                except Exception:
-                    pass
-            file_handles = [fs.open(uri, "rb") for uri in uris]
-            return xr.open_mfdataset(
-                file_handles,
-                combine="by_coords",
-                engine="netcdf4"
-            )
+                    with open(local_path, "rb") as f:
+                        header = f.read(4)
+                    if header.startswith(b"PK\x03\x04"):
+                        # It's a ZIP file, extract it
+                        log.debug(f"[era5] extracting ZIP file: {base_name}")
+                        with zipfile.ZipFile(local_path, "r") as zf:
+                            # Extract first file (should be the NetCDF)
+                            extracted = zf.namelist()[0]
+                            zf.extract(extracted, temp_dir)
+                            extracted_path = os.path.join(temp_dir, extracted)
+                            # Remove zip file
+                            os.remove(local_path)
+                            local_path = extracted_path
+                except Exception as e:
+                    log.debug(f"[era5] not a ZIP file or extraction failed: {e}")
+                
+                local_paths.append(local_path)
+            
+            # Open local files - try h5netcdf first, then netcdf4
+            log.info(f"[era5] opening {len(local_paths)} local files")
+            try:
+                ds = xr.open_mfdataset(
+                    local_paths,
+                    combine="by_coords",
+                    engine="h5netcdf"
+                )
+            except Exception as e:
+                log.warning(f"[era5] h5netcdf failed, trying netcdf4: {e}")
+                ds = xr.open_mfdataset(
+                    local_paths,
+                    combine="by_coords",
+                    engine="netcdf4"
+                )
+            
+            # Store temp_dir in dataset attributes for cleanup later
+            ds.attrs["_temp_dir"] = temp_dir
+            log.info(f"[era5] dataset opened, temp files in {temp_dir} (will be cleaned up on close)")
+            return ds
     else:
         # Local files - use standard approach
         return xr.open_mfdataset(uris, combine="by_coords")
@@ -963,10 +999,15 @@ def main():
 
     setup_logging(args.log_level)
 
+    # Track temp directories for cleanup
+    temp_dirs_to_cleanup = []
+    
     # Load ERA5 single-levels
     if args.era5_single_manifest:
         log.info(f"Loading ERA5 Single from manifest: {args.era5_single_manifest}")
         era5_single = _open_era5_from_manifest(args.era5_single_manifest)
+        if "_temp_dir" in era5_single.attrs:
+            temp_dirs_to_cleanup.append(era5_single.attrs["_temp_dir"])
     else:
         log.info(f"Loading ERA5 Single: {args.era5_single}")
         era5_single = xr.open_dataset(args.era5_single)
@@ -975,6 +1016,8 @@ def main():
     if args.era5_land_manifest:
         log.info(f"Loading ERA5-Land from manifest: {args.era5_land_manifest}")
         era5_land = _open_era5_from_manifest(args.era5_land_manifest)
+        if "_temp_dir" in era5_land.attrs:
+            temp_dirs_to_cleanup.append(era5_land.attrs["_temp_dir"])
     else:
         log.info(f"Loading ERA5-Land:  {args.era5_land}")
         era5_land = xr.open_dataset(args.era5_land)
@@ -1252,6 +1295,15 @@ def main():
         )
     else:
         log.info(f"[manifest] no new OM files processed for {args.tile_id}")
+    
+    # Clean up temp directories used for S3 downloads
+    for temp_dir in temp_dirs_to_cleanup:
+        try:
+            if os.path.exists(temp_dir):
+                log.info(f"[cleanup] removing temp directory: {temp_dir}")
+                shutil.rmtree(temp_dir)
+        except Exception as e:
+            log.warning(f"[cleanup] failed to remove {temp_dir}: {e}")
 
 
 if __name__ == "__main__":
