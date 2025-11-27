@@ -829,6 +829,15 @@ def _open_era5_from_manifest(manifest_uri: str) -> xr.Dataset:
             ds.attrs["_temp_dir"] = temp_dir
             log.info(f"[era5] dataset opened, temp files in {temp_dir} (will be cleaned up on close)")
             return ds
+        except Exception as e:
+            # On error, try to clean up temp directory
+            log.warning(f"[era5] error processing S3 files, cleaning up temp dir: {e}")
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+            raise
     else:
         # Local files - use standard approach
         return xr.open_mfdataset(uris, combine="by_coords")
