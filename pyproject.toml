@@ -25,7 +25,9 @@ dependencies = [
   "fastparquet",
   "h5netcdf",
   "cftime",
-  "boto3"
+  "boto3",
+  "s3fs",
+  "fsspec"
 ]
 
 [tool.setuptools.package-dir]

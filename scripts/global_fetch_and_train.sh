@@ -68,9 +68,21 @@ CHUNK_HOURS="${CHUNK_HOURS:-168}"   # OM batch window
 # -----------------------------
 BREAKDOWN_DEG="${BREAKDOWN_DEG:-30}"
 
-# Process only the first N tiles for testing (default: 1 tile).
-# For full globe set TILE_SAMPLE_COUNT to a large number, e.g. 999999.
-TILE_SAMPLE_COUNT="${TILE_SAMPLE_COUNT:-1}"
+# Build degree edges first to calculate total tiles
+LAT_EDGES_TEMP=( $(build_edges -90 90 "$BREAKDOWN_DEG") )
+LON_EDGES_TEMP=( $(build_edges -180 180 "$BREAKDOWN_DEG") )
+
+# Process only the first N tiles for testing (default: all tiles).
+# Set TILE_SAMPLE_COUNT to a number to limit processing (e.g. 1 for testing).
+# For full globe, leave unset or set to a large number (e.g. 999999).
+if [[ -z "${TILE_SAMPLE_COUNT:-}" ]]; then
+    # Calculate total number of tiles
+    TOTAL_TILES=$(( (${#LAT_EDGES_TEMP[@]} - 1) * (${#LON_EDGES_TEMP[@]} - 1) ))
+    TILE_SAMPLE_COUNT=$TOTAL_TILES
+    log "[info] TILE_SAMPLE_COUNT not set, processing all $TOTAL_TILES tiles"
+else
+    TILE_SAMPLE_COUNT="${TILE_SAMPLE_COUNT}"
+fi
 
 # Optional include/exclude regex for tile names (applied after enumeration)
 TILE_INCLUDE_REGEX="${TILE_INCLUDE_REGEX:-}"   # e.g. "^LAT0_LON0$"
@@ -191,8 +203,9 @@ have_pairs_done() { local tile="$1"; [[ -s "${OUT_TILE_DIR}/${tile}.pairs.done" 
 # -----------------------------
 # Tiling enumeration
 # -----------------------------
-LAT_EDGES=( $(build_edges -90 90 "$BREAKDOWN_DEG") )
-LON_EDGES=( $(build_edges -180 180 "$BREAKDOWN_DEG") )
+# Use the edges we calculated earlier
+LAT_EDGES=( "${LAT_EDGES_TEMP[@]}" )
+LON_EDGES=( "${LON_EDGES_TEMP[@]}" )
 
 log "Global tiling: BREAKDOWN_DEG=$BREAKDOWN_DEG  tiles_lat=$(( ${#LAT_EDGES[@]} - 1 ))  tiles_lon=$(( ${#LON_EDGES[@]} - 1 ))"
 log "Test sample: TILE_SAMPLE_COUNT=$TILE_SAMPLE_COUNT  OM steps: ${LAT_STEPS}x${LON_STEPS}  Window: ${START} → ${END}"

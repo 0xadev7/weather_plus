@@ -678,11 +678,37 @@ def hybrid_truth(era5_land: xr.Dataset, era5_single: xr.Dataset, key: str, grid,
 # -------------------------
 def _load_json_uri(uri: str):
     """Load a small JSON file from local disk or a remote URI (e.g. s3://...)."""
-    if isinstance(uri, str) and (uri.startswith("s3://") or "://" in uri):
-        with fsspec.open(uri, "rt") as f:
+    if isinstance(uri, str) and uri.startswith("s3://"):
+        # Use boto3 via s3_utils instead of fsspec (which requires s3fs)
+        try:
+            from utils.s3_utils import _bucket_and_prefix, _client, _join_key
+        except Exception:
+            from s3_utils import _bucket_and_prefix, _client, _join_key  # type: ignore
+        
+        # Parse s3://bucket/key into bucket and key
+        parts = uri.replace("s3://", "").split("/", 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid S3 URI: {uri}")
+        bucket_from_uri, key_from_uri = parts
+        
+        # Use boto3 to download the JSON file
+        cli = _client()
+        try:
+            resp = cli.get_object(Bucket=bucket_from_uri, Key=key_from_uri)
+            return json.loads(resp["Body"].read().decode("utf-8"))
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to load manifest from S3: {uri} - {e}")
+    elif isinstance(uri, str) and "://" in uri:
+        # Fallback to fsspec for other protocols (http, https, etc.)
+        try:
+            with fsspec.open(uri, "rt") as f:
+                return json.load(f)
+        except ImportError:
+            raise ImportError(f"fsspec with appropriate backend required for URI: {uri}")
+    else:
+        # Local file
+        with open(uri, "r") as f:
             return json.load(f)
-    with open(uri, "r") as f:
-        return json.load(f)
 
 
 def _uris_from_manifest(meta: dict) -> list[str]:
@@ -726,7 +752,15 @@ def _open_era5_from_manifest(manifest_uri: str) -> xr.Dataset:
         raise SystemExit(f"Manifest {manifest_uri!r} contained no 'parts'")
     log.info(f"[era5] opening {len(uris)} chunks from manifest {manifest_uri}")
     # Let xarray/fsspec handle remote reads (e.g. s3://...) without touching local disk.
-    return xr.open_mfdataset(uris, combine="by_coords")
+    # Note: Requires s3fs to be installed for S3 support
+    try:
+        return xr.open_mfdataset(uris, combine="by_coords")
+    except ImportError as e:
+        if "s3fs" in str(e).lower() or "s3" in str(e).lower():
+            raise ImportError(
+                "s3fs is required for reading S3 files. Install it with: pip install s3fs"
+            ) from e
+        raise
 
 
 # -------------------------
