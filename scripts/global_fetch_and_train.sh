@@ -32,6 +32,22 @@ export WEATHER_S3_PREFIX="${WEATHER_S3_PREFIX:-weather-plus}"
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*"; }
 
+# Build degree edges: [-90, -60, -30, 0, 30, 60, 90] for 30°
+build_edges() {
+    local min="$1" max="$2" step="$3"
+  python - "$min" "$max" "$step" <<'PY'
+import sys
+mn=float(sys.argv[1]); mx=float(sys.argv[2]); st=float(sys.argv[3])
+edges=[]
+x=mn
+while x<mx:
+    edges.append(x)
+    x+=st
+edges.append(mx)
+print(" ".join(str(int(e)) if float(e).is_integer() else str(e) for e in edges))
+PY
+}
+
 # -----------------------------
 # Time window for data fetch and training
 # -----------------------------
@@ -133,22 +149,6 @@ run_logged() {
         local exit_code=${PIPESTATUS[0]}
         return $exit_code
     fi
-}
-
-# Build degree edges: [-90, -60, -30, 0, 30, 60, 90] for 30°
-build_edges() {
-    local min="$1" max="$2" step="$3"
-  python - "$min" "$max" "$step" <<'PY'
-import sys
-mn=float(sys.argv[1]); mx=float(sys.argv[2]); st=float(sys.argv[3])
-edges=[]
-x=mn
-while x<mx:
-    edges.append(x)
-    x+=st
-edges.append(mx)
-print(" ".join(str(int(e)) if float(e).is_integer() else str(e) for e in edges))
-PY
 }
 
 iso_to_tag() {
