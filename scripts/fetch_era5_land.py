@@ -275,18 +275,24 @@ def main():
                 log(f"[info] existing manifest has {len(existing_parts)} parts")
                 
                 # Check if all required chunks are present
+                # Only check for day tags if month tag doesn't exist (month might need splitting)
                 required_tags = set()
                 for am, bm, tagm in chunks:
-                    required_tags.add(tagm)
-                    # If month fails, we'll need day tags
-                    for ad, bd, tagd in days_between(am, bm):
-                        required_tags.add(tagd)
+                    if tagm in existing_parts:
+                        # Month exists, we don't need day tags for this month
+                        required_tags.add(tagm)
+                    else:
+                        # Month doesn't exist, might need to split into days
+                        # Add month tag first, then day tags as fallback
+                        required_tags.add(tagm)
+                        for ad, bd, tagd in days_between(am, bm):
+                            required_tags.add(tagd)
                 
                 missing_tags = required_tags - set(existing_parts.keys())
                 if not missing_tags:
                     log(f"[skip] all required parts already exist in manifest")
                     return
-                log(f"[info] need to download {len(missing_tags)} missing parts")
+                log(f"[info] need to download {len(missing_tags)} missing parts (months or days)")
             else:
                 log(f"[warn] could not load existing manifest, will re-download")
                 manifest_exists = False

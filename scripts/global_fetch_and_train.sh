@@ -111,8 +111,15 @@ run_logged() {
     if [[ "$DRY_RUN" == "1" ]]; then
         log "[dry-run] $cmd"
         echo "[$(ts)] [dry-run] $cmd" >> "$logfile"
+        return 0
     else
-        bash -lc "$cmd 2>&1 | tee -a \"$logfile\""
+        # Run command and capture exit code
+        # Use set +e temporarily to avoid exiting on error
+        set +e
+        bash -lc "$cmd" 2>&1 | tee -a "$logfile"
+        local exit_code=${PIPESTATUS[0]}
+        set -e
+        return $exit_code
     fi
 }
 
@@ -217,6 +224,9 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         
         log "=== Tile $TILE  area=($LAT_MIN,$LON_MIN,$LAT_MAX,$LON_MAX)  ==="
         
+        # Process tile - continue to next even if this one fails
+        set +e  # Temporarily disable exit on error for this tile
+        
         # ------------------- Open-Meteo (features) -------------------
         if [[ "$ERA5_ONLY" != "1" ]]; then
             # Build command with optional S3 flag
@@ -268,8 +278,13 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
                 ERA5_LAND_CMD="$ERA5_LAND_CMD --to-s3"
             fi
             
-            run_logged "$ERA5_SINGLE_CMD" "logs/${TILE}_era5_single.log"
-            run_logged "$ERA5_LAND_CMD" "logs/${TILE}_era5_land.log"
+            # Run ERA5 scripts - continue even if one fails
+            if ! run_logged "$ERA5_SINGLE_CMD" "logs/${TILE}_era5_single.log"; then
+                log "[warn] ERA5 single fetch failed for $TILE, continuing..."
+            fi
+            if ! run_logged "$ERA5_LAND_CMD" "logs/${TILE}_era5_land.log"; then
+                log "[warn] ERA5 land fetch failed for $TILE, continuing..."
+            fi
             
             # ------------------- Pairing (OM→features, ERA5→target) -------------------
             if ! have_pairs_done "$TILE"; then
@@ -294,6 +309,8 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         else
             log "[era5/pair] skipped (OM_ONLY=1)"
         fi
+        
+        set -e  # Re-enable exit on error
         
         log "=== Done $TILE ==="
     done
