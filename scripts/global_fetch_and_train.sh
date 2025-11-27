@@ -17,7 +17,9 @@
 #   scripts/fetch_era5_land.py
 #   scripts/make_training_pairs_tile.py
 
-set -euo pipefail
+set -uo pipefail
+# Note: We don't use 'set -e' globally because we want to continue processing
+# tiles even if one fails. Individual commands handle errors via run_logged.
 export HDF5_USE_FILE_LOCKING=FALSE
 
 # --- Required: point to your S3 bucket/prefix (AWS creds must be configured) ---
@@ -114,11 +116,9 @@ run_logged() {
         return 0
     else
         # Run command and capture exit code
-        # Use set +e temporarily to avoid exiting on error
-        set +e
+        # Note: We don't use 'set -e' globally, so we can capture errors here
         bash -lc "$cmd" 2>&1 | tee -a "$logfile"
         local exit_code=${PIPESTATUS[0]}
-        set -e
         return $exit_code
     fi
 }
@@ -224,9 +224,6 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         
         log "=== Tile $TILE  area=($LAT_MIN,$LON_MIN,$LAT_MAX,$LON_MAX)  ==="
         
-        # Process tile - continue to next even if this one fails
-        set +e  # Temporarily disable exit on error for this tile
-        
         # ------------------- Open-Meteo (features) -------------------
         if [[ "$ERA5_ONLY" != "1" ]]; then
             # Build command with optional S3 flag
@@ -246,7 +243,7 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
                 OM_CMD="$OM_CMD --to-s3"
             fi
             
-            run_logged "$OM_CMD" "logs/${TILE}_om.log"
+            run_logged "$OM_CMD" "logs/${TILE}_om.log" || log "[warn] OM fetch had errors for $TILE, continuing..."
         else
             log "[om] skipped (ERA5_ONLY=1)"
         fi
@@ -297,7 +294,7 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
                 --era5-single-manifest \"$S3_SINGLE_MANIFEST\" \
                 --era5-land-manifest   \"$S3_LAND_MANIFEST\" \
                 --tile-id              \"$TILE\"" \
-                "logs/${TILE}_pair.log"
+                "logs/${TILE}_pair.log" || log "[warn] Pairing had errors for $TILE, continuing..."
                 : > "${OUT_TILE_DIR}/${TILE}.pairs.done"
                 if [[ "$CLEAN_INTERMEDIATES" == "1" ]]; then
                     # Left here for backwards-compat; in S3-only mode these files won't exist.
@@ -309,8 +306,6 @@ for ((i=0; i<${#LAT_EDGES[@]}-1; i++)); do
         else
             log "[era5/pair] skipped (OM_ONLY=1)"
         fi
-        
-        set -e  # Re-enable exit on error
         
         log "=== Done $TILE ==="
     done
